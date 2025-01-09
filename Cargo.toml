@@ -6,8 +6,14 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-gix = {version = "0.72", default-features = false, features = ["max-performance-safe", "revision"] }
+gix = {version = "0.72", default-features = false, features = ["max-performance-safe", "revision", "status"] }
 anyhow = "1.0"
 env_logger = "0.11"
 log = "0.4"
 rustix = { version = "1", features = ["process"] }
+
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
