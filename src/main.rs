@@ -8,6 +8,7 @@ use gix::{
     sec::{self, trust::DefaultForLevel},
 };
 use log::debug;
+use num_enum::IntoPrimitive;
 use std::borrow::Cow;
 use std::env;
 use std::path::Path;
@@ -55,14 +56,24 @@ fn main() {
 
     println!("{progress_status}");
 
-    let status = get_status(&repo);
+    let status = get_status(&repo).into();
 
     exit(status)
 }
 
-fn get_status(repo: &Repo) -> i32 {
+#[derive(Debug, IntoPrimitive)]
+#[repr(i32)]
+enum Status {
+    Unchange = 5,
+    Change = 6,
+    Untracked = 7,
+    HasError = 8,
+    Disable = 9,
+}
+
+fn get_status(repo: &Repo) -> Status {
     if env::var("BASH_DISABLE_GIT_FILE_TRACKING").is_ok() {
-        return 9;
+        return Status::Disable;
     }
 
     let repo = repo.repo.to_thread_local();
@@ -75,7 +86,7 @@ fn get_status(repo: &Repo) -> i32 {
         .status(progress::Discard)
         .inspect_err(|e| debug!("{e}"))
     else {
-        return 8;
+        return Status::HasError;
     };
 
     let status = status.index_worktree_submodules(Submodule::AsConfigured { check_dirty: true });
@@ -104,14 +115,16 @@ fn get_status(repo: &Repo) -> i32 {
     // This will start the status machinery, collecting status items in the background.
     // Thus, we can do some work in this thread without blocking, before starting to count status items.
     let Ok(status) = status.into_iter(None).inspect_err(|e| debug!("{e}")) else {
-        return 8;
+        return Status::HasError;
     };
+
+    let mut is_untracked = false;
 
     for change in status.filter_map(Result::ok) {
         use gix::status;
         match &change {
             status::Item::TreeIndex(_) => {
-                return 6;
+                return Status::Change;
             }
             status::Item::IndexWorktree(change) => {
                 use gix::status::index_worktree::Item;
@@ -121,13 +134,13 @@ fn get_status(repo: &Repo) -> i32 {
                         status: EntryStatus::Conflict(_),
                         ..
                     } => {
-                        return 6;
+                        return Status::Change;
                     }
                     Item::Modification {
                         status: EntryStatus::Change(Change::Removed),
                         ..
                     } => {
-                        return 6;
+                        return Status::Change;
                     }
                     Item::Modification {
                         status:
@@ -137,13 +150,13 @@ fn get_status(repo: &Repo) -> i32 {
                             ),
                         ..
                     } => {
-                        return 6;
+                        return Status::Change;
                     }
                     Item::Modification {
                         status: EntryStatus::Change(Change::Type { .. }),
                         ..
                     } => {
-                        return 6;
+                        return Status::Change;
                     }
                     Item::DirectoryContents {
                         entry:
@@ -153,7 +166,7 @@ fn get_status(repo: &Repo) -> i32 {
                             },
                         ..
                     } => {
-                        return 7;
+                        is_untracked = true;
                     }
                     Item::Rewrite { .. } => {
                         unreachable!(
@@ -166,16 +179,20 @@ fn get_status(repo: &Repo) -> i32 {
         }
     }
 
-    5
+    if is_untracked {
+        return Status::Untracked;
+    }
+
+    Status::Unchange
 }
 
-fn get_status_sparse() -> i32 {
+fn get_status_sparse() -> Status {
     let cmd = Command::new("git")
         .arg("status")
         .arg("--porcelain")
         .output();
 
-    let mut status = 0;
+    let mut status = Status::Unchange;
 
     if let Ok(cmd) = cmd {
         if cmd.status.success() {
@@ -187,25 +204,23 @@ fn get_status_sparse() -> i32 {
                 .map(|x| x.0);
 
             match out_iter.next() {
-                None => {
-                    status = 5;
-                }
+                None => {}
                 Some(x)
                     if MODIFY_STATUS.contains(x)
                         || MODIFY_STATUS.contains(&x[..1])
                         || MODIFY_STATUS.contains(&x[1..2]) =>
                 {
-                    status = 6;
+                    status = Status::Change;
                 }
                 Some("??") => {
-                    status = 7;
+                    status = Status::Untracked;
                 }
                 _ => {}
             }
 
             debug!("git status --porcelain output: {out}");
         } else {
-            status = 8;
+            status = Status::HasError;
         }
     }
 
