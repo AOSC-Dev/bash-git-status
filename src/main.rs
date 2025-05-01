@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gix::commit::describe::SelectRef::{self};
 use gix::state::InProgress;
 use gix::{
-    sec::{self, trust::DefaultForLevel},
     Repository, ThreadSafeRepository,
+    sec::{self, trust::DefaultForLevel},
 };
 use log::debug;
 use std::env;
