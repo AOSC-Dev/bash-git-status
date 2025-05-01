@@ -179,7 +179,7 @@ fn get_repo(path: &Path) -> Result<Repo> {
     let repo = Repo {
         repo: shared_repo,
         branch,
-        workdir: repository.work_dir().map(PathBuf::from),
+        workdir: repository.workdir().map(PathBuf::from),
         path,
         state: repository.state(),
     };
