@@ -1,6 +1,6 @@
 [package]
 name = "bash-git-status"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,4 +10,3 @@ gix = {version = "0.72", default-features = false, features = ["max-performance-
 anyhow = "1.0"
 env_logger = "0.11"
 log = "0.4"
-rustix = { version = "1", features = ["process"] }
