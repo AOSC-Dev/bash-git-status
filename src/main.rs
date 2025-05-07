@@ -71,7 +71,7 @@ fn print_and_get_status(progress_status: &str) -> i32 {
             let mut out_iter = out
                 .trim()
                 .split('\n')
-                .filter_map(|x| x.rsplit_once(' '))
+                .filter_map(|x| x.split_once(' '))
                 .map(|x| x.0);
 
             match out_iter.next() {
