@@ -11,7 +11,14 @@ gix = { version = "0.88", default-features = false, features = [
     "revision",
     "sha1",
     "sha256",
+    "status",
 ] }
 anyhow = "1.0"
 env_logger = "0.11"
 log = "0.4"
+num_enum = "0.7.3"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
