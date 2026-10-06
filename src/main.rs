@@ -2,12 +2,13 @@
 //! and exiting with a code describing the worktree state.
 //!
 //! By default the status comes from a small per-user daemon over a unix
-//! socket (see `src/server.rs`): cached entries younger than
-//! `BASH_GIT_STATUS_TTL_MS` (default 500ms) are answered instantly, older
-//! ones are recomputed before the reply. The daemon starts on demand and
+//! socket (see `src/server.rs`): entries of a repository are answered
+//! instantly as long as it didn't change (see `src/cache.rs`), and are
+//! otherwise recomputed before the reply. The daemon starts on demand and
 //! exits after `BASH_GIT_STATUS_IDLE_SECS` (default 600) of inactivity.
 //! `BASH_GIT_STATUS_NO_SERVER=1` always computes in-process instead.
 
+mod cache;
 mod server;
 mod status;
 

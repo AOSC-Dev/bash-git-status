@@ -1,6 +1,7 @@
 //! Status computation: the prompt text and the exit code.
 
 use anyhow::{Context, Result, anyhow};
+use gix::bstr::BString;
 use gix::commit::describe::SelectRef::{self};
 use gix::progress;
 use gix::state::InProgress;
@@ -11,25 +12,21 @@ use gix::{
 };
 use log::debug;
 use num_enum::IntoPrimitive;
-use std::borrow::Cow;
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct Repo {
     pub repo: ThreadSafeRepository,
 
-    /// If `current_dir` is a git repository or is contained within one,
-    /// this is the current branch name of that repo.
-    pub branch: Option<String>,
-
-    /// State
-    pub state: Option<InProgress>,
+    /// The directory the status was asked for. `git` is asked about it when the index is sparse,
+    /// as `git status` only reports what is below the directory it runs in.
+    pub cwd: PathBuf,
 }
 
 const MODIFY_STATUS: &str = "MATDRCU";
 
-#[derive(Debug, IntoPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive)]
 #[repr(i32)]
 pub enum Status {
     Unchange = 5,
@@ -37,6 +34,18 @@ pub enum Status {
     Untracked = 7,
     HasError = 8,
     Disable = 9,
+}
+
+/// The outcome of a status computation, along with what is needed to cache it.
+pub struct Report {
+    pub status: Status,
+
+    /// Whether [`Status::Change`] is due to a difference between the tree `HEAD` points at and the
+    /// index, as opposed to a difference between the index and the worktree.
+    pub staged: bool,
+
+    /// The repository-relative paths of the untracked entries the directory walk has seen.
+    pub untracked: Vec<BString>,
 }
 
 /// Compute the prompt text and exit code for the repository containing `cwd`.
@@ -60,27 +69,39 @@ pub fn compute(cwd: &Path) -> (i32, String) {
         }
     };
 
-    let code: i32 = get_status(&repo).into();
+    let code: i32 = report(&repo).status.into();
 
     (code, text)
 }
 
-fn get_status(repo: &Repo) -> Status {
+/// Compute the status of `repo`, collecting the information needed by a [`Guard`](crate::cache::Guard)
+/// to detect later changes.
+pub fn report(repo: &Repo) -> Report {
+    let mut report = Report {
+        status: Status::Unchange,
+        staged: false,
+        untracked: Vec::new(),
+    };
+
     if env::var("BASH_DISABLE_GIT_FILE_TRACKING").is_ok() {
-        return Status::Disable;
+        report.status = Status::Disable;
+        return report;
     }
 
+    let cwd = &repo.cwd;
     let repo = repo.repo.to_thread_local();
 
-    if repo.index_or_empty().is_ok_and(|repo| repo.is_sparse()) {
-        return get_status_sparse();
+    if repo.index_or_empty().is_ok_and(|index| index.is_sparse()) {
+        report.status = get_status_sparse(cwd);
+        return report;
     }
 
     let Ok(status) = repo
         .status(progress::Discard)
         .inspect_err(|e| debug!("{e}"))
     else {
-        return Status::HasError;
+        report.status = Status::HasError;
+        return report;
     };
 
     let status = status.index_worktree_submodules(Submodule::AsConfigured { check_dirty: true });
@@ -109,58 +130,29 @@ fn get_status(repo: &Repo) -> Status {
     // This will start the status machinery, collecting status items in the background.
     // Thus, we can do some work in this thread without blocking, before starting to count status items.
     let Ok(status) = status.into_iter(None).inspect_err(|e| debug!("{e}")) else {
-        return Status::HasError;
+        report.status = Status::HasError;
+        return report;
     };
-
-    let mut is_untracked = false;
 
     for change in status.filter_map(Result::ok) {
         use gix::status;
         match &change {
             status::Item::TreeIndex(_) => {
-                return Status::Change;
+                report.staged = true;
+                report.status = Status::Change;
+                return report;
             }
             status::Item::IndexWorktree(change) => {
                 use gix::status::index_worktree::Item;
-                use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
                 match change {
-                    Item::Modification {
-                        status: EntryStatus::Conflict { .. },
-                        ..
-                    } => {
-                        return Status::Change;
+                    modification @ Item::Modification { .. } if worktree_change(modification) => {
+                        report.status = Status::Change;
+                        return report;
                     }
-                    Item::Modification {
-                        status: EntryStatus::Change(Change::Removed),
-                        ..
-                    } => {
-                        return Status::Change;
-                    }
-                    Item::Modification {
-                        status:
-                            EntryStatus::IntentToAdd
-                            | EntryStatus::Change(
-                                Change::Modification { .. } | Change::SubmoduleModification(_),
-                            ),
-                        ..
-                    } => {
-                        return Status::Change;
-                    }
-                    Item::Modification {
-                        status: EntryStatus::Change(Change::Type { .. }),
-                        ..
-                    } => {
-                        return Status::Change;
-                    }
-                    Item::DirectoryContents {
-                        entry:
-                            gix::dir::Entry {
-                                status: gix::dir::entry::Status::Untracked,
-                                ..
-                            },
-                        ..
-                    } => {
-                        is_untracked = true;
+                    Item::DirectoryContents { entry, .. }
+                        if entry.status == gix::dir::entry::Status::Untracked =>
+                    {
+                        report.untracked.push(entry.rela_path.clone());
                     }
                     Item::Rewrite { .. } => {
                         unreachable!(
@@ -173,17 +165,53 @@ fn get_status(repo: &Repo) -> Status {
         }
     }
 
-    if is_untracked {
-        return Status::Untracked;
+    if !report.untracked.is_empty() {
+        report.status = Status::Untracked;
     }
 
-    Status::Unchange
+    report
 }
 
-fn get_status_sparse() -> Status {
+/// Whether an index-to-worktree item means the worktree changed in a way `git status` reports.
+///
+/// Not every item is a change: [`EntryStatus::NeedsUpdate`](gix::status::plumbing::index_as_worktree::EntryStatus::NeedsUpdate)
+/// exists to let callers refresh the index so a later status is cheaper.
+pub fn worktree_change(item: &gix::status::index_worktree::Item) -> bool {
+    use gix::status::index_worktree::Item;
+    use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
+
+    let Item::Modification { status, .. } = item else {
+        return false;
+    };
+
+    matches!(
+        status,
+        EntryStatus::Conflict { .. }
+            | EntryStatus::IntentToAdd
+            | EntryStatus::Change(Change::Removed)
+            | EntryStatus::Change(Change::Modification { .. } | Change::SubmoduleModification(_))
+            | EntryStatus::Change(Change::Type { .. })
+    )
+}
+
+/// Whether `repo` uses a sparse index, in which case its status is obtained from `git` and does not
+/// only depend on the repository as a whole.
+pub fn is_sparse(repo: &Repo) -> bool {
+    repo.repo
+        .to_thread_local()
+        .index_or_empty()
+        .is_ok_and(|index| index.is_sparse())
+}
+
+/// Ask `git` for the status of `cwd`, used for repositories whose index is sparse.
+///
+/// The directory matters: `git status` only reports what is below it, so the daemon has to ask for
+/// the directory the client is in rather than its own.
+fn get_status_sparse(cwd: &Path) -> Status {
     let cmd = Command::new("git")
         .arg("status")
         .arg("--porcelain")
+        .current_dir(cwd)
         .output();
 
     let mut status = Status::Unchange;
@@ -221,24 +249,26 @@ fn get_status_sparse() -> Status {
     status
 }
 
-fn repo_progress(repo: &Repo) -> Result<String> {
-    let git_repo = repo.repo.to_thread_local();
+pub fn repo_progress(repo: &Repo) -> Result<String> {
+    progress_of(&repo.repo)
+}
 
-    let display_name = repo
-        .branch
-        .as_ref()
-        .map(Cow::Borrowed)
-        .or_else(|| get_tag(&git_repo).map(Cow::Owned))
+/// Like [`repo_progress()`], but for an already-opened repository.
+pub fn progress_of(shared: &ThreadSafeRepository) -> Result<String> {
+    let git_repo = shared.to_thread_local();
+
+    let display_name = get_current_branch(&git_repo)
+        .or_else(|| get_tag(&git_repo))
         .or_else(|| {
-            Some(Cow::Owned(format!(
+            Some(format!(
                 "(detached {})",
                 git_repo.head_id().ok()?.shorten_or_id()
-            )))
+            ))
         });
 
     let display_name = display_name.ok_or_else(|| anyhow!("Failed to get branch/hash"))?;
 
-    let s = if let Some(state) = &repo.state {
+    let s = if let Some(state) = &git_repo.state() {
         match state {
             InProgress::ApplyMailbox => format!("Mailbox progress {display_name}"),
             InProgress::ApplyMailboxRebase => {
@@ -264,7 +294,7 @@ fn repo_progress(repo: &Repo) -> Result<String> {
     Ok(s)
 }
 
-fn get_repo(path: &Path) -> Result<Repo> {
+pub fn get_repo(path: &Path) -> Result<Repo> {
     let mut git_open_opts_map = sec::trust::Mapping::<gix::open::Options>::default();
 
     let config = gix::open::permissions::Config {
@@ -295,16 +325,10 @@ fn get_repo(path: &Path) -> Result<Repo> {
     )
     .context("Failed to find git repo")?;
 
-    let repository = shared_repo.to_thread_local();
-    let branch = get_current_branch(&repository);
-
-    let repo = Repo {
+    Ok(Repo {
         repo: shared_repo,
-        branch,
-        state: repository.state(),
-    };
-
-    Ok(repo)
+        cwd: path.to_path_buf(),
+    })
 }
 
 fn get_current_branch(repository: &Repository) -> Option<String> {
