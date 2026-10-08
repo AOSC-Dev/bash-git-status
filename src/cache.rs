@@ -570,29 +570,19 @@ fn rule_stamps(
     dirs: &[PathBuf],
     global_excludes: Option<&Path>,
 ) -> Vec<FileStamp> {
-    // Only the rule files that are there: one that appears or disappears changes the mtime of the
-    // directory holding it, which is watched, so it is enough to watch the metadata of the ones
-    // that exist now.
+    // Two metadata calls per watched directory: listing one instead would cost a lookup per entry
+    // it holds, which is more than the calls it saves. Only the ones that are there are kept - a
+    // rule file that appears changes the mtime of the directory holding it, which is watched, so
+    // watching the ones that exist is enough, and a stamp of a file that isn't there would be
+    // looked at again on every check.
     let mut rules: Vec<FileStamp> = dirs
         .par_iter()
         .with_min_len(PARALLEL_THRESHOLD)
         .flat_map_iter(|dir| {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return Vec::new().into_iter();
-            };
-
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    matches!(
-                        path.file_name().and_then(OsStr::to_str),
-                        Some(".gitignore" | ".gitattributes")
-                    )
-                })
-                .map(FileStamp::read)
-                .collect::<Vec<_>>()
+            [dir.join(".gitignore"), dir.join(".gitattributes")]
                 .into_iter()
+                .map(FileStamp::read)
+                .filter(|stamp| stamp.state.is_some())
         })
         .collect();
 
@@ -717,6 +707,31 @@ mod tests {
         let guard = repo.capture();
 
         std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn an_edited_rule_file_is_noticed() {
+        let repo = TempRepo::new("edited-rule");
+        let rule = repo.path.join("sub/.gitignore");
+        std::fs::create_dir(repo.path.join("sub")).expect("the directory can be created");
+        std::fs::write(&rule, "*.log\n").expect("the rule can be written");
+        let guard = repo.capture();
+
+        std::fs::write(&rule, "*\n").expect("the rule can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_rule_file_that_appears_is_noticed() {
+        let repo = TempRepo::new("new-rule");
+        std::fs::create_dir(repo.path.join("sub")).expect("the directory can be created");
+        let guard = repo.capture();
+
+        std::fs::write(repo.path.join("sub/.gitignore"), "*.log\n")
+            .expect("the rule can be written");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }

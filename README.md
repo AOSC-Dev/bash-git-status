@@ -28,9 +28,10 @@ file - includes those that hold none: a file created in an empty directory, or i
 are all ignored, changes the mtime of a directory that is watched. Directories that are ignored
 themselves are left out, as anything that can be created in them is ignored as well. Editing an
 ignore rule doesn't change any directory, so the files that decide what a scan reports are watched
-too: the `.gitignore` and `.gitattributes` next to every watched directory, `info/exclude` and
-`info/attributes` of the repository, the configuration that selects the global rule file, and that
-file wherever it is.
+too: the `.gitignore` and `.gitattributes` that exist next to every watched directory, `info/exclude`
+and `info/attributes` of the repository, the configuration that selects the global rule file, and
+that file wherever it is. Watching a rule file that doesn't exist isn't needed, because creating one
+changes the mtime of the directory that holds it.
 
 An entry is still only served for `BASH_GIT_STATUS_TRUST_SECS` (default 60) before the status is
 computed from scratch again, which bounds the effect of filesystems that don't update directory

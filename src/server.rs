@@ -333,7 +333,9 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
     // The worktree walk the guard needs runs while the status is computed, so that a repository
     // that has to be scanned anyway doesn't wait for it afterwards.
     let watch = cache::Watch::start(&repo.repo);
+    let t = Instant::now();
     let report = status::report(&repo);
+    debug!("DBGT scan {:?}", t.elapsed());
     let code: i32 = report.status.into();
 
     // Only a status that covers the repository as a whole can be watched: a sparse index is served
@@ -345,7 +347,11 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
                 Status::Unchange | Status::Change | Status::Untracked
             ) && !status::is_sparse(&repo) =>
         {
-            cache::Guard::capture(&repo, &report, watch).map(|guard| (root.to_path_buf(), guard))
+            let t = Instant::now();
+            let g = cache::Guard::capture(&repo, &report, watch)
+                .map(|guard| (root.to_path_buf(), guard));
+            debug!("DBGT capture {:?}", t.elapsed());
+            g
         }
         _ => None,
     };
