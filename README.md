@@ -55,6 +55,9 @@ any repository are kept for `BASH_GIT_STATUS_TTL_MS` (default 500).
   `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, `GIT_NAMESPACE` and the rest - computes the
   status in-process, because the daemon was started by another shell and has another environment.
   The daemon drops those overrides when it starts, so it never answers another shell's repository.
+- The same goes for a shell whose configuration would be read from somewhere else: the daemon reads
+  the `HOME` and `XDG_CONFIG_HOME` of the shell that started it, so its answer carries a fingerprint
+  of them and a client that has another pair computes the status itself.
 - When no daemon can be reached, `bash-git-status` computes the status in-process, which is the
   historical behaviour and the fallback at every step.
 - `BASH_GIT_STATUS_NO_SERVER=1` disables the daemon entirely.

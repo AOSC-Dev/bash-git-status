@@ -38,16 +38,18 @@ use std::time::{Duration, Instant};
 
 /// Protocol marker, so a client can't be fooled by a reply from an outdated daemon after the
 /// binary was rebuilt, and so that a request can't be taken for a reply.
-const PREFIX: &[u8] = b"BGS2 ";
+const PREFIX: &[u8] = b"BGS3 ";
 
 /// The longest directory a request may ask about; a path that doesn't exist is longer than it can
 /// be, and the length is what a client states rather than what it sent.
 const MAX_PATH: usize = 8 * 1024;
 
 /// The environment overrides that decide which repository a directory belongs to and what its
-/// status is: `git` and the library honour them, so a daemon that was started by another shell -
-/// with another idea of both - can't answer for a shell that has one of them set.
-const ENVIRONMENT_OVERRIDES: [&str; 18] = [
+/// status is: `git` and the library honour them, and this program's own switches change the text it
+/// prints, so a daemon that was started by another shell - with another idea of them - can't answer
+/// for a shell that has one of them set.
+const ENVIRONMENT_OVERRIDES: [&str; 19] = [
+    "BASH_DISABLE_GIT_FILE_TRACKING",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_ATTR_NOSYSTEM",
     "GIT_ATTR_SYSTEM",
@@ -139,6 +141,7 @@ pub fn run() -> ! {
         });
     info!("listening on {}", socket.display());
 
+    let identity = config_identity();
     let cache: Cache = Default::default();
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     spawn_idle_monitor(socket, Arc::clone(&last_activity));
@@ -150,7 +153,7 @@ pub fn run() -> ! {
                 let last_activity = Arc::clone(&last_activity);
                 thread::spawn(move || {
                     touch(&last_activity);
-                    if let Err(e) = handle(stream, &cache) {
+                    if let Err(e) = handle(stream, &cache, identity) {
                         debug!("connection error: {e:#}");
                     }
                     touch(&last_activity);
@@ -160,6 +163,32 @@ pub fn run() -> ! {
         }
     }
     unreachable!("the accept loop handles every error")
+}
+
+/// A fingerprint of the environment that decides which configuration files are read.
+///
+/// The daemon keeps the `HOME` and `XDG_CONFIG_HOME` of the shell that started it and reads the
+/// configuration they point at, so a client whose own point somewhere else can't take its answer:
+/// both sides hash what they have and only agree if it is the same. Hashed, because all the client
+/// needs to know is whether the answers would be made with the same configuration.
+fn config_identity() -> u64 {
+    /// FNV-1a, which only has to tell environments apart, not resist an attack.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    for name in ["HOME", "XDG_CONFIG_HOME"] {
+        if let Some(value) = std::env::var_os(name) {
+            for byte in value.as_encoded_bytes() {
+                hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
+            }
+        }
+
+        // A separator, so that two variables can't be mistaken for one value.
+        hash = hash.wrapping_mul(PRIME) ^ u64::from(u8::MAX);
+    }
+
+    hash
 }
 
 /// The name of an environment override that is set, if there is one.
@@ -182,12 +211,13 @@ fn drop_environment_overrides() {
     }
 }
 
-/// Read a request, which is `BGS2 <ttl-ms> <len>` followed by that many bytes of a directory.
+/// Read a request, which is `BGS3 <ttl-ms> <identity> <len>` followed by that many bytes of a
+/// directory.
 ///
 /// The path is sent as its length instead of being terminated: a directory whose name contains a
 /// newline is then still the directory that was asked about, and not a prefix of it that happens to
 /// be another repository.
-fn read_request(reader: &mut impl BufRead) -> Result<Option<(Duration, PathBuf)>> {
+fn read_request(reader: &mut impl BufRead) -> Result<Option<(u64, Duration, PathBuf)>> {
     let mut header = Vec::new();
     if reader.read_until(b'\n', &mut header)? == 0 {
         return Ok(None);
@@ -197,17 +227,24 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<(Duration, PathBuf)>
         return Ok(None);
     };
     let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
-    let Some(space) = rest.iter().position(|b| *b == b' ') else {
-        return Ok(None);
+    let mut fields = rest.split(|b| *b == b' ');
+    let number = |field: Option<&[u8]>, radix: u32| {
+        std::str::from_utf8(field?)
+            .ok()
+            .and_then(|field| u64::from_str_radix(field, radix).ok())
     };
-    let parse = |field: &[u8]| std::str::from_utf8(field).ok()?.parse::<u64>().ok();
-    let (Some(ttl), Some(len)) = (parse(&rest[..space]), parse(&rest[space + 1..])) else {
+
+    let (Some(ttl), Some(identity), Some(len)) = (
+        number(fields.next(), 10),
+        number(fields.next(), 16),
+        number(fields.next(), 10),
+    ) else {
         return Ok(None);
     };
     let Ok(len) = usize::try_from(len) else {
         return Ok(None);
     };
-    if len == 0 || len > MAX_PATH {
+    if len == 0 || len > MAX_PATH || fields.next().is_some() {
         return Ok(None);
     }
 
@@ -215,16 +252,27 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<(Duration, PathBuf)>
     reader.read_exact(&mut path)?;
 
     Ok(Some((
+        identity,
         Duration::from_millis(ttl),
         PathBuf::from(OsStr::from_bytes(&path)),
     )))
 }
 
-fn handle(mut stream: Stream, cache: &Cache) -> Result<()> {
+fn handle(mut stream: Stream, cache: &Cache, identity: u64) -> Result<()> {
     let mut reader = BufReader::new(&stream);
-    let Some((ttl, cwd)) = read_request(&mut reader)? else {
+    let Some((client, ttl, cwd)) = read_request(&mut reader)? else {
         return Ok(());
     };
+
+    // The daemon reads the configuration of the shell that started it. A client whose own is
+    // somewhere else gets no answer at all, so that it computes the status itself instead of taking
+    // one that was made without its configuration - a global `.gitconfig`, or a file it includes,
+    // can change what the status is - and so that nothing is computed for an answer that would be
+    // thrown away.
+    if client != identity {
+        debug!("a client with another configuration asked, not answering");
+        return Ok(());
+    }
 
     // Every directory of a repository shares one entry, keyed by its root.
     let root = repo_root(&cwd);
@@ -333,9 +381,7 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
     // The worktree walk the guard needs runs while the status is computed, so that a repository
     // that has to be scanned anyway doesn't wait for it afterwards.
     let watch = cache::Watch::start(&repo.repo);
-    let t = Instant::now();
     let report = status::report(&repo);
-    debug!("DBGT scan {:?}", t.elapsed());
     let code: i32 = report.status.into();
 
     // Only a status that covers the repository as a whole can be watched: a sparse index is served
@@ -347,11 +393,7 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
                 Status::Unchange | Status::Change | Status::Untracked
             ) && !status::is_sparse(&repo) =>
         {
-            let t = Instant::now();
-            let g = cache::Guard::capture(&repo, &report, watch)
-                .map(|guard| (root.to_path_buf(), guard));
-            debug!("DBGT capture {:?}", t.elapsed());
-            g
+            cache::Guard::capture(&repo, &report, watch).map(|guard| (root.to_path_buf(), guard))
         }
         _ => None,
     };
@@ -452,9 +494,11 @@ fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
     let _ = stream.set_send_timeout(Some(Duration::from_secs(5)));
 
     let path = cwd.as_os_str().as_bytes();
-    let mut request = Vec::with_capacity(PREFIX.len() + 24 + path.len());
+    let mut request = Vec::with_capacity(PREFIX.len() + 48 + path.len());
     request.extend_from_slice(PREFIX);
     request.extend_from_slice(ttl().as_millis().to_string().as_bytes());
+    request.push(b' ');
+    request.extend_from_slice(format!("{:016x}", config_identity()).as_bytes());
     request.push(b' ');
     request.extend_from_slice(path.len().to_string().as_bytes());
     request.push(b'\n');
@@ -557,4 +601,58 @@ pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request as a client sends it, for `path`.
+    fn request(path: &[u8]) -> Vec<u8> {
+        let mut request = Vec::new();
+        request.extend_from_slice(PREFIX);
+        request.extend_from_slice(b"500 0011223344556677 ");
+        request.extend_from_slice(path.len().to_string().as_bytes());
+        request.push(b'\n');
+        request.extend_from_slice(path);
+
+        request
+    }
+
+    #[test]
+    fn a_request_carries_the_path_verbatim() {
+        let path = "/tmp/a\nnew";
+        let request = request(path.as_bytes());
+        let mut reader = BufReader::new(&request[..]);
+
+        let (identity, ttl, read) = read_request(&mut reader)
+            .expect("a request can be read")
+            .expect("the request is well formed");
+
+        assert_eq!(identity, 0x0011_2233_4455_6677);
+        assert_eq!(ttl, Duration::from_millis(500));
+        assert_eq!(read, PathBuf::from(path));
+    }
+
+    #[test]
+    fn a_malformed_request_is_ignored() {
+        for request in [
+            // Too few fields, an old protocol, a path that is too long or too short, and a field
+            // that doesn't belong.
+            &b"BGS3 500 0011223344556677\n"[..],
+            &b"BGS2 500 0011223344556677 3\nabc"[..],
+            &b"BGS3 500 0011223344556677 99999\nabc"[..],
+            &b"BGS3 500 0011223344556677 3\nab"[..],
+            &b"BGS3 500 0011223344556677 3 x\nabc"[..],
+            &b"BGS3 x 0011223344556677 3\nabc"[..],
+        ] {
+            let mut reader = BufReader::new(request);
+
+            assert!(
+                !matches!(read_request(&mut reader), Ok(Some(_))),
+                "read the request {:?}",
+                String::from_utf8_lossy(request)
+            );
+        }
+    }
 }
