@@ -1,7 +1,6 @@
 //! Status computation: the prompt text and the exit code.
 
 use anyhow::{Context, Result, anyhow};
-use gix::bstr::BString;
 use gix::commit::describe::SelectRef::{self};
 use gix::progress;
 use gix::state::InProgress;
@@ -44,8 +43,8 @@ pub struct Report {
     /// index, as opposed to a difference between the index and the worktree.
     pub staged: bool,
 
-    /// The repository-relative paths of the untracked entries the directory walk has seen.
-    pub untracked: Vec<BString>,
+    /// Whether the directory walk has seen an untracked entry.
+    pub untracked: bool,
 }
 
 /// Compute the prompt text and exit code for the repository containing `cwd`.
@@ -80,7 +79,7 @@ pub fn report(repo: &Repo) -> Report {
     let mut report = Report {
         status: Status::Unchange,
         staged: false,
-        untracked: Vec::new(),
+        untracked: false,
     };
 
     if env::var("BASH_DISABLE_GIT_FILE_TRACKING").is_ok() {
@@ -152,7 +151,7 @@ pub fn report(repo: &Repo) -> Report {
                     Item::DirectoryContents { entry, .. }
                         if entry.status == gix::dir::entry::Status::Untracked =>
                     {
-                        report.untracked.push(entry.rela_path.clone());
+                        report.untracked = true;
                     }
                     Item::Rewrite { .. } => {
                         unreachable!(
@@ -165,7 +164,7 @@ pub fn report(repo: &Repo) -> Report {
         }
     }
 
-    if !report.untracked.is_empty() {
+    if report.untracked {
         report.status = Status::Untracked;
     }
 

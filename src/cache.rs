@@ -40,6 +40,7 @@ const MAX_WATCHED_DIRS: usize = 64 * 1024;
 const PARALLEL_THRESHOLD: usize = 64;
 
 /// How a cached status fares against the current state of its repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     /// Nothing that can change the cached status has changed.
     Unchanged,
@@ -67,6 +68,10 @@ pub struct Guard {
     /// captured.
     dirs: Vec<FileStamp>,
 
+    /// The ignore rules and the configuration that selects them, which can change what a scan
+    /// reports without changing a directory, see [`rule_stamps()`].
+    rules: Vec<FileStamp>,
+
     /// When the status this guard was captured for was computed.
     created: Instant,
 }
@@ -90,7 +95,7 @@ impl Guard {
     ///
     /// Returns `None` if the repository can't be watched for changes reliably, in which case the
     /// caller has to fall back to keeping its result for a fixed amount of time.
-    pub fn capture(repo: &status::Repo, report: &status::Report) -> Option<Guard> {
+    pub fn capture(repo: &status::Repo, report: &status::Report, watch: Watch) -> Option<Guard> {
         let shared = &repo.repo;
         let tl = shared.to_thread_local();
         let git_dir = tl.git_dir().to_owned();
@@ -102,12 +107,20 @@ impl Guard {
         ];
         fingerprint.extend(head_stamps(&git_dir, tl.common_dir())?);
 
+        let dirs = watch.dirs()?;
+        let global_rules = tl
+            .config_snapshot()
+            .trusted_path("core.excludesFile")
+            .ok()
+            .flatten();
+
         Some(Guard {
             repo: shared.clone(),
             code: report.status.into(),
             staged: report.staged,
             fingerprint,
-            dirs: watch_dirs(shared, report)?,
+            rules: rule_stamps(&git_dir, tl.common_dir(), &dirs, global_rules.as_deref()),
+            dirs: stamp_all(&dirs),
             created: Instant::now(),
         })
     }
@@ -147,7 +160,21 @@ impl Guard {
             Err(_) => return Verdict::Unknown,
         }
 
-        if !dirs_unchanged(&self.dirs) {
+        let (dirs, rules) = rayon::join(
+            || {
+                self.dirs
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::dir_matches)
+            },
+            || {
+                self.rules
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::matches)
+            },
+        );
+        if !(dirs && rules) {
             return Verdict::Unknown;
         }
 
@@ -419,35 +446,58 @@ fn head_stamps(git_dir: &Path, common_dir: &Path) -> Option<Vec<FileStamp>> {
     Some(vec![FileStamp::read(loose), FileStamp::read(packed)])
 }
 
+/// A worktree walk that records the directories it descends into.
+///
+/// It is started before the status of a repository is computed and read afterwards, because both
+/// walk the worktree and the operating system can do that on two cores at once.
+pub struct Watch(Option<std::thread::JoinHandle<Option<Vec<PathBuf>>>>);
+
+impl Watch {
+    /// Start recording the directories of `shared`'s worktree.
+    pub fn start(shared: &ThreadSafeRepository) -> Watch {
+        let shared = shared.clone();
+        let walk = std::thread::Builder::new()
+            .name("bash-git-status walk".into())
+            .spawn(move || watch_dirs(&shared));
+
+        Watch(walk.ok())
+    }
+
+    /// The directories the walk descended into.
+    fn dirs(self) -> Option<Vec<PathBuf>> {
+        self.0?.join().ok()?
+    }
+}
+
 /// Every directory that could gain or lose a file, as it is now.
 ///
-/// A new file always changes the mtime of the directory holding it, so watching every parent of a
-/// tracked or untracked entry is enough to notice files appearing and disappearing anywhere,
-/// including in directories that are new: the parent of a new directory is watched, and the
-/// worktree root is watched as well.
+/// A new file changes the mtime of the directory holding it, so watching every directory a status
+/// scan descends into is enough to notice files appearing and disappearing anywhere - including in
+/// directories that held no file at the time: an empty directory is descended into just like any
+/// other, and so is a directory whose contents are all ignored. Directories that are ignored
+/// themselves are left out, as everything that can be created in them is ignored as well.
 ///
 /// The inode is watched along with the mtime, so that a directory which was replaced - by a
 /// symbolic link, another directory, or a file - is noticed even when the mtime it reports through
 /// the replacement happens to be the one that was recorded.
-fn watch_dirs(shared: &ThreadSafeRepository, report: &status::Report) -> Option<Vec<FileStamp>> {
+fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Vec<PathBuf>> {
     let repo = shared.to_thread_local();
     let workdir = repo.workdir()?.to_owned();
+    let index = repo.index_or_empty().ok()?;
 
-    let mut rel: HashSet<Vec<u8>> = HashSet::new();
+    let mut walked = WatchDirs::default();
+    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+    repo.dirwalk(
+        &index,
+        Vec::<gix::bstr::BString>::new(),
+        &should_interrupt,
+        repo.dirwalk_options().ok()?,
+        &mut walked,
+    )
+    .ok()?;
+
+    let mut rel = walked.0;
     rel.insert(Vec::new());
-
-    if let Ok(index) = repo.index_or_empty() {
-        for entry in index.entries() {
-            insert_parents(&mut rel, entry.path(&index));
-        }
-    }
-
-    // The parents of what the directory walk reported as untracked are watched as well, so that
-    // files vanishing from an untracked directory (and with it the untracked status) are noticed.
-    for path in &report.untracked {
-        insert_parents(&mut rel, path);
-    }
-
     if rel.len() > MAX_WATCHED_DIRS {
         return None;
     }
@@ -458,28 +508,137 @@ fn watch_dirs(shared: &ThreadSafeRepository, report: &status::Report) -> Option<
         .collect();
     dirs.sort();
 
-    Some(
-        dirs.par_iter()
-            .with_min_len(PARALLEL_THRESHOLD)
-            .map(FileStamp::read)
-            .collect(),
-    )
+    Some(dirs)
 }
 
-/// Add every directory above `path` to `rel`.
+/// The metadata of every path, as it is now.
+fn stamp_all(paths: &[PathBuf]) -> Vec<FileStamp> {
+    paths
+        .par_iter()
+        .with_min_len(PARALLEL_THRESHOLD)
+        .map(FileStamp::read)
+        .collect()
+}
+
+/// The directories a directory walk descends into.
 ///
-/// With `path` relative to the worktree, these are the components of the path that end at a `/`,
-/// which is every directory it can be in.
-fn insert_parents(rel: &mut HashSet<Vec<u8>>, path: &[u8]) {
-    for pos in (0..path.len()).filter(|pos| path[*pos] == b'/') {
-        rel.insert(path[..pos].to_vec());
+/// [`can_recurse()`](gix::dir::walk::Delegate::can_recurse) is called for every directory the walk
+/// sees, so recording the ones that are entered describes the worktree without listing it again:
+/// the walk itself has that answer, and it knows which directories are ignored.
+#[derive(Default)]
+struct WatchDirs(HashSet<Vec<u8>>);
+
+impl gix::dir::walk::Delegate for WatchDirs {
+    fn emit(
+        &mut self,
+        _entry: gix::dir::EntryRef<'_>,
+        _collapsed: Option<gix::dir::entry::Status>,
+    ) -> gix::dir::walk::Action {
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn can_recurse(
+        &mut self,
+        entry: gix::dir::EntryRef<'_>,
+        for_deletion: Option<gix::dir::walk::ForDeletionMode>,
+        worktree_root_is_repository: bool,
+    ) -> bool {
+        let recurse = entry.status.can_recurse(
+            entry.disk_kind,
+            entry.pathspec_match,
+            for_deletion,
+            worktree_root_is_repository,
+        );
+        if recurse {
+            self.0.insert(entry.rela_path.to_vec());
+        }
+        recurse
     }
 }
 
-fn dirs_unchanged(dirs: &[FileStamp]) -> bool {
-    dirs.par_iter()
+/// The files that decide which files a status scan reports, and that can change without any
+/// directory changing: the ignore rules of the worktree, of the repository, of the user and of the
+/// system, and the configuration that selects them.
+///
+/// A rule file that appears or disappears changes the mtime of the directory holding it, which is
+/// watched, but editing one that exists doesn't, so the metadata of the file itself is watched
+/// too. The configuration is watched because it says which global rule file applies, and because
+/// it can turn untracked reporting off.
+fn rule_stamps(
+    git_dir: &Path,
+    common_dir: &Path,
+    dirs: &[PathBuf],
+    global_excludes: Option<&Path>,
+) -> Vec<FileStamp> {
+    // Only the rule files that are there: one that appears or disappears changes the mtime of the
+    // directory holding it, which is watched, so it is enough to watch the metadata of the ones
+    // that exist now.
+    let mut rules: Vec<FileStamp> = dirs
+        .par_iter()
         .with_min_len(PARALLEL_THRESHOLD)
-        .all(FileStamp::dir_matches)
+        .flat_map_iter(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new().into_iter();
+            };
+
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    matches!(
+                        path.file_name().and_then(OsStr::to_str),
+                        Some(".gitignore" | ".gitattributes")
+                    )
+                })
+                .map(FileStamp::read)
+                .collect::<Vec<_>>()
+                .into_iter()
+        })
+        .collect();
+
+    for path in [
+        common_dir.join("info/exclude"),
+        common_dir.join("info/attributes"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+    ] {
+        rules.push(FileStamp::read(path));
+    }
+
+    // The global rule file `core.excludesFile` points at, wherever it is.
+    if let Some(global) = global_excludes {
+        rules.push(FileStamp::read(global));
+    }
+
+    rules.extend(global_rule_files().into_iter().map(FileStamp::read));
+    rules
+}
+
+/// The rule and configuration files of the user and of the system, at the places git looks for
+/// them.
+fn global_rule_files() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+
+    let mut paths = vec![
+        std::env::var_os("GIT_CONFIG_SYSTEM")
+            .map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from),
+    ];
+    if let Some(config_home) = &config_home {
+        // The default location of the global rule file, and the configuration next to it.
+        paths.push(config_home.join("git/ignore"));
+        paths.push(config_home.join("git/config"));
+    }
+    if let Some(home) = &home {
+        paths.push(home.join(".gitconfig"));
+    }
+    if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        paths.push(PathBuf::from(global));
+    }
+
+    paths
 }
 
 /// How long a guard may be used without re-verifying the assumption that directory mtimes change
@@ -495,19 +654,97 @@ fn trust_window() -> Duration {
 mod tests {
     use super::*;
 
+    /// A repository of its own, in a directory that is removed when the test ends.
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new(name: &str) -> TempRepo {
+            let path = std::env::temp_dir().join(format!(
+                "bash-git-status-test-{}-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            gix::init(&path).expect("a repository can be created");
+            let repo = TempRepo { path };
+            repo.init_commit();
+
+            repo
+        }
+
+        fn open(&self) -> status::Repo {
+            status::get_repo(&self.path).expect("the repository can be opened")
+        }
+
+        /// Give the repository a commit, so that `HEAD` points at a reference that can be watched.
+        fn init_commit(&self) {
+            let repo = self.open().repo.to_thread_local();
+            let tree = repo
+                .write_object(gix::objs::Tree::empty())
+                .expect("an empty tree can be written")
+                .detach();
+            let who = gix::actor::SignatureRef {
+                name: "test".into(),
+                email: "test@example.com".into(),
+                time: "0 +0000",
+            };
+
+            repo.commit_as(who, who, "HEAD", "init", tree, None::<gix::ObjectId>)
+                .expect("a commit can be created");
+        }
+
+        /// Capture a guard of the repository as it is now, as the daemon would.
+        fn capture(&self) -> Guard {
+            let repo = self.open();
+            let watch = Watch::start(&repo.repo);
+            let report = status::report(&repo);
+
+            Guard::capture(&repo, &report, watch).expect("the repository can be watched")
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
-    fn every_directory_above_a_path_is_watched() {
-        let mut rel = HashSet::new();
-        insert_parents(&mut rel, b"a/b/c.txt");
+    fn a_file_in_an_empty_directory_is_noticed() {
+        let repo = TempRepo::new("empty-directory");
+        std::fs::create_dir(repo.path.join("empty")).expect("the directory can be created");
+        let guard = repo.capture();
 
-        assert_eq!(rel.len(), 2);
-        assert!(rel.contains(b"a".as_slice()));
-        assert!(rel.contains(b"a/b".as_slice()));
+        std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
 
-        // A path in the root of the worktree has no directory of its own; the root is watched
-        // separately.
-        insert_parents(&mut rel, b"top.txt");
-        assert_eq!(rel.len(), 2);
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_changed_ignore_rule_is_noticed() {
+        let repo = TempRepo::new("ignore-rule");
+        let exclude = repo.path.join(".git/info/exclude");
+        std::fs::write(&exclude, "*.log\n").expect("the rule can be written");
+        let guard = repo.capture();
+
+        std::fs::write(&exclude, "").expect("the rule can be taken back");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn empty_directories_are_watched_and_ignored_ones_are_not() {
+        let repo = TempRepo::new("watched-directories");
+        std::fs::write(repo.path.join(".gitignore"), "ignored/\n")
+            .expect("the rule can be written");
+        std::fs::create_dir(repo.path.join("empty")).expect("the directory can be created");
+        std::fs::create_dir(repo.path.join("ignored")).expect("the directory can be created");
+
+        let dirs = watch_dirs(&repo.open().repo).expect("the worktree can be walked");
+
+        assert!(dirs.contains(&repo.path.join("empty")));
+        assert!(!dirs.iter().any(|dir| dir.ends_with("ignored")));
     }
 
     #[test]

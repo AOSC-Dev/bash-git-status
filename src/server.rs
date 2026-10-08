@@ -258,6 +258,9 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
         return without_repo(cwd);
     };
 
+    // The worktree walk the guard needs runs while the status is computed, so that a repository
+    // that has to be scanned anyway doesn't wait for it afterwards.
+    let watch = cache::Watch::start(&repo.repo);
     let report = status::report(&repo);
     let code: i32 = report.status.into();
 
@@ -270,7 +273,7 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
                 Status::Unchange | Status::Change | Status::Untracked
             ) && !status::is_sparse(&repo) =>
         {
-            cache::Guard::capture(&repo, &report).map(|guard| (root.to_path_buf(), guard))
+            cache::Guard::capture(&repo, &report, watch).map(|guard| (root.to_path_buf(), guard))
         }
         _ => None,
     };
