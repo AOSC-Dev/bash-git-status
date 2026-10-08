@@ -108,18 +108,22 @@ impl Guard {
         fingerprint.extend(head_stamps(&git_dir, tl.common_dir())?);
 
         let dirs = watch.dirs()?;
-        let global_rules = tl
-            .config_snapshot()
-            .trusted_path("core.excludesFile")
-            .ok()
-            .flatten();
+        let config = tl.config_snapshot();
+        let excluding = config.trusted_path("core.excludesFile").ok().flatten();
+        let attributing = config.trusted_path("core.attributesFile").ok().flatten();
 
         Some(Guard {
             repo: shared.clone(),
             code: report.status.into(),
             staged: report.staged,
             fingerprint,
-            rules: rule_stamps(&git_dir, tl.common_dir(), &dirs, global_rules.as_deref()),
+            rules: rule_stamps(
+                &git_dir,
+                tl.common_dir(),
+                &dirs,
+                excluding.as_deref(),
+                attributing.as_deref(),
+            ),
             dirs: stamp_all(&dirs),
             created: Instant::now(),
         })
@@ -563,9 +567,9 @@ impl gix::dir::walk::Delegate for WatchDirs {
     }
 }
 
-/// The files that decide which files a status scan reports, and that can change without any
-/// directory changing: the ignore rules of the worktree, of the repository, of the user and of the
-/// system, and the configuration that selects them.
+/// The files that decide which files a status scan reports and how, and that can change without
+/// any directory changing: the ignore and attributes rules of the worktree, of the repository, of
+/// the user and of the system, and the configuration that selects them.
 ///
 /// A rule file that appears or disappears changes the mtime of the directory holding it, which is
 /// watched, but editing one that exists doesn't, so the metadata of the file itself is watched
@@ -576,6 +580,7 @@ fn rule_stamps(
     common_dir: &Path,
     dirs: &[PathBuf],
     global_excludes: Option<&Path>,
+    global_attributes: Option<&Path>,
 ) -> Vec<FileStamp> {
     // Two metadata calls per watched directory: listing one instead would cost a lookup per entry
     // it holds, which is more than the calls it saves. Only the ones that are there are kept - a
@@ -600,9 +605,9 @@ fn rule_stamps(
         rules.push(FileStamp::read(path));
     }
 
-    // The global rule file `core.excludesFile` points at, wherever it is.
-    if let Some(global) = global_excludes {
-        rules.push(FileStamp::read(global));
+    // The rule files `core.excludesFile` and `core.attributesFile` point at, wherever they are.
+    for configured in [global_excludes, global_attributes].into_iter().flatten() {
+        rules.push(FileStamp::read(configured));
     }
 
     rules.extend(global_rule_files().into_iter().map(FileStamp::read));
@@ -619,17 +624,24 @@ fn rule_stamps(
     rules
 }
 
-/// The rule files of the user, at the place git looks for them when `core.excludesFile` is not
-/// set: `$XDG_CONFIG_HOME/git/ignore`, which is `$HOME/.config/git/ignore` by default.
+/// The rule files at the places git reads them without being told to: the attributes file of the
+/// system, and the rule files of the user that `core.excludesFile` and `core.attributesFile` default
+/// to - `$XDG_CONFIG_HOME/git/ignore|attributes`, which are `$HOME/.config/git/ignore|attributes`
+/// when `$XDG_CONFIG_HOME` is unset.
 fn global_rule_files() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".config")));
 
-    config_home
-        .map(|config_home| vec![config_home.join("git/ignore")])
-        .unwrap_or_default()
+    // The system attributes file, which is `/etc/gitattributes` on unix.
+    let mut paths = vec![PathBuf::from("/etc/gitattributes")];
+    if let Some(config_home) = &config_home {
+        paths.push(config_home.join("git/ignore"));
+        paths.push(config_home.join("git/attributes"));
+    }
+
+    paths
 }
 
 /// The configuration files git reads for a repository, in the places it looks for them.
@@ -838,6 +850,25 @@ mod tests {
         let guard = repo.capture();
 
         std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_changed_attributes_file_is_noticed() {
+        let repo = TempRepo::new("attributes-file");
+        let attributes = repo.path.join("attributes");
+        std::fs::write(&attributes, "*.txt\t-text\n").expect("the rule can be written");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!(
+            "[core]\n\tattributesFile = {}\n",
+            attributes.display()
+        ));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&attributes, "*.txt\ttext\n").expect("the rule can be edited");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
