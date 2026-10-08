@@ -412,16 +412,23 @@ fn query(cwd: &Path) -> Option<(i32, String)> {
     }
 
     let socket = socket_path();
-    if let Some(result) = try_query(&socket, cwd) {
-        return Some(result);
+    match try_query(&socket, cwd) {
+        Answer::Status(code, text) => return Some((code, text)),
+        // A daemon that didn't answer this client won't answer it either when it is asked again,
+        // and it holds the lock that keeps another one from starting: computing here is the only
+        // answer left, and waiting for that lock to be released would only delay it.
+        Answer::Stranger => return None,
+        Answer::NoDaemon => {}
     }
 
     // No daemon (or it is still starting): spawn one and give it a moment.
     spawn_server();
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     loop {
-        if let Some(result) = try_query(&socket, cwd) {
-            return Some(result);
+        match try_query(&socket, cwd) {
+            Answer::Status(code, text) => return Some((code, text)),
+            Answer::Stranger => return None,
+            Answer::NoDaemon => {}
         }
         if Instant::now() >= deadline {
             return None;
@@ -430,9 +437,29 @@ fn query(cwd: &Path) -> Option<(i32, String)> {
     }
 }
 
-fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
-    let name = socket.to_fs_name::<GenericFilePath>().ok()?;
-    let mut stream = Stream::connect(name).ok()?;
+/// How asking the daemon went.
+enum Answer {
+    /// The daemon answered with a status.
+    Status(i32, String),
+
+    /// Nothing answered: either nothing is listening, or the daemon that is still starting hasn't
+    /// begun to. Waiting for one is worthwhile, as it may answer after it bound its socket.
+    NoDaemon,
+
+    /// Something is listening but didn't answer with a status of this protocol: a daemon of another
+    /// build, or one whose configuration isn't the one this client would be answered with. Neither
+    /// will ever answer this client, so waiting for a daemon that can't start while they live would
+    /// only delay the computation.
+    Stranger,
+}
+
+fn try_query(socket: &Path, cwd: &Path) -> Answer {
+    let Some(name) = socket.to_fs_name::<GenericFilePath>().ok() else {
+        return Answer::NoDaemon;
+    };
+    let Ok(mut stream) = Stream::connect(name) else {
+        return Answer::NoDaemon;
+    };
     let _ = stream.set_recv_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_send_timeout(Some(Duration::from_secs(5)));
 
@@ -444,16 +471,30 @@ fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
     request.extend_from_slice(path.len().to_string().as_bytes());
     request.push(b'\n');
     request.extend_from_slice(path);
-    stream.write_all(&request).ok()?;
+    if stream.write_all(&request).is_err() {
+        return Answer::Stranger;
+    }
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
+    if stream.read_to_end(&mut response).is_err() {
+        return Answer::Stranger;
+    }
 
-    // A daemon of an older build answers in its own protocol; computing in-process is better than
-    // reading that answer as this one.
+    match read_reply(&response) {
+        Some((code, text)) => Answer::Status(code, text),
+        None => Answer::Stranger,
+    }
+}
+
+/// The status in a reply, if it is a reply of this protocol.
+///
+/// A daemon of another build answers in its own protocol, which is why a reply that doesn't read as
+/// one of this one is not an answer at all.
+fn read_reply(response: &[u8]) -> Option<(i32, String)> {
     let response = response.strip_prefix(PREFIX)?;
     let newline = response.iter().position(|b| *b == b'\n')?;
     let (code, text) = response.split_at(newline);
+
     Some((
         std::str::from_utf8(code).ok()?.parse().ok()?,
         String::from_utf8(text[1..].to_vec()).ok()?,
@@ -612,6 +653,23 @@ mod tests {
             "a directory that may become a repository must not be remembered"
         );
         std::fs::remove_dir_all(&dir).expect("the directory can be removed");
+    }
+
+    #[test]
+    fn a_reply_that_is_not_of_this_protocol_is_no_answer() {
+        assert_eq!(read_reply(b"BGS4 5\nmain"), Some((5, "main".to_owned())));
+        assert_eq!(read_reply(b"BGS4 1\n"), Some((1, String::new())));
+        assert_eq!(
+            read_reply(b"BGS4 7\nmain\nmore"),
+            Some((7, "main\nmore".to_owned()))
+        );
+
+        // An older daemon, one of a client that isn't this one, a truncated reply, and a code that
+        // isn't a number.
+        assert_eq!(read_reply(b"BGS3 500 5\nmain"), None);
+        assert_eq!(read_reply(b""), None);
+        assert_eq!(read_reply(b"BGS4 5"), None);
+        assert_eq!(read_reply(b"BGS4 x\nmain"), None);
     }
 
     #[test]
