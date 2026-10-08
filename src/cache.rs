@@ -27,6 +27,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use gix::ThreadSafeRepository;
+use gix::config::Source;
+use gix::config::source::Kind;
 use rayon::prelude::*;
 
 use crate::server::env_u64;
@@ -749,32 +751,37 @@ fn global_rule_files() -> Vec<PathBuf> {
 }
 
 /// The configuration files git reads for a repository, in the places it looks for them.
+///
+/// Where they are is [`storage_location()`](Source::storage_location)'s knowledge, asked for instead
+/// of written down here: which configuration a git installation brings along, whether the system one
+/// is overridden, where the user's is, and that a `git worktree` has a configuration of its own, all
+/// depend on the git binary of the environment and on variables that only that call reads.
 fn config_roots(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".config")));
-
-    let mut paths = vec![
-        std::env::var_os("GIT_CONFIG_SYSTEM")
-            .map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from),
-        common_dir.join("config"),
-        git_dir.join("config.worktree"),
+    /// The kinds of configuration a status is read with, in the order they are loaded.
+    const KINDS: [Kind; 5] = [
+        Kind::GitInstallation,
+        Kind::System,
+        Kind::Global,
+        Kind::Repository,
+        Kind::Override,
     ];
 
-    // The configuration of the git installation, which isn't always the system one: a git that was
-    // built into a prefix of its own - Homebrew's, one from a store - reads an `etc/gitconfig` of
-    // its own in addition to it, and where that is, only that git knows.
-    paths.extend(gix::path::env::installation_config().map(Path::to_owned));
+    let mut env = |name: &str| std::env::var_os(name);
+    let mut paths = Vec::new();
+    for kind in KINDS {
+        for source in kind.sources() {
+            let Some(path) = source.storage_location(&mut env) else {
+                continue;
+            };
 
-    if let Some(config_home) = &config_home {
-        paths.push(config_home.join("git/config"));
-    }
-    if let Some(home) = &home {
-        paths.push(home.join(".gitconfig"));
-    }
-    if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
-        paths.push(PathBuf::from(global));
+            // The configuration of the repository itself is named relative to it: `common_dir` holds
+            // the one that is shared by every worktree, `git_dir` the one of this checkout.
+            paths.push(match source {
+                Source::Local => common_dir.join(path),
+                Source::Worktree => git_dir.join(path),
+                _ => path,
+            });
+        }
     }
 
     paths
@@ -976,20 +983,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_configuration_of_the_git_installation_is_watched() {
-        let repo = TempRepo::new("installation-config");
+    fn every_configuration_gix_reads_is_watched() {
+        let repo = TempRepo::new("configuration-roots");
         let git_dir = repo.path.join(".git");
-        let Some(installation) = gix::path::env::installation_config() else {
-            // A git that doesn't report one - because it is the system's own, or because it can't be
-            // run at all - leaves nothing to watch.
-            return;
-        };
+        let roots = config_roots(&git_dir, &git_dir);
 
-        assert!(
-            config_roots(&git_dir, &git_dir).contains(&installation.to_owned()),
-            "{} is read as configuration but not watched",
-            installation.display()
-        );
+        let mut env = |name: &str| std::env::var_os(name);
+        for kind in [
+            Kind::GitInstallation,
+            Kind::System,
+            Kind::Global,
+            Kind::Repository,
+        ] {
+            for source in kind.sources() {
+                let Some(path) = source.storage_location(&mut env) else {
+                    continue;
+                };
+                let path = match source {
+                    Source::Local => git_dir.join(path),
+                    Source::Worktree => git_dir.join(path),
+                    _ => path,
+                };
+
+                assert!(
+                    roots.contains(&path),
+                    "{} is read as configuration but not watched",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
