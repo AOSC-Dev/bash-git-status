@@ -1,59 +1,61 @@
-//! A small per-user daemon that caches repository status.
+//! A small per-shell daemon that caches repository status.
 //!
-//! Clients ask it over a unix socket for the prompt text and exit code of
-//! their current directory. Every directory of a repository shares one entry,
-//! and the entry is reused for as long as the repository is unchanged: staged
-//! changes, the branch and a modified, added or removed file all invalidate it
-//! (see `crate::cache`). Only when a repository can't be watched, or when its
-//! entry is older than `BASH_GIT_STATUS_TRUST_SECS`, the answer is recomputed
-//! unconditionally, and directories outside a repository are kept for
-//! `BASH_GIT_STATUS_TTL_MS` (default 500ms).
+//! Each shell starts one daemon over two pipes it keeps open (see `contrib/bash-git-status.bash`),
+//! and every `bash-git-status` call in that shell asks it for the prompt text and exit code of the
+//! current directory. Every directory of a repository shares one entry, and the entry is reused for
+//! as long as the repository is unchanged: staged changes, the branch and a modified, added or
+//! removed file all invalidate it (see `crate::cache`). Repositories that can't be watched at all
+//! are recomputed once their entry is older than `BASH_GIT_STATUS_TTL_MS`, and directories outside
+//! any repository are kept for just as long (default 500ms).
 //!
-//! The daemon starts on demand, exits after `BASH_GIT_STATUS_IDLE_SECS`
-//! (default 600) without requests, and a lock file next to the socket keeps
-//! concurrent clients from spawning duplicates. `BASH_GIT_STATUS_SERVER_LOG`
-//! redirects the daemon's stderr into a file for debugging.
+//! An entry is only answered from for `BASH_GIT_STATUS_TRUST_SECS` (see
+//! [`crate::cache::trust_window()`]): once that passed, the prompt it would answer waits for the
+//! status to be computed from scratch again, which is what re-establishes the trust in directory
+//! mtimes that a status is given for that long.
+//!
+//! Requests and replies are single lines over the pipes, and a reply is matched to its request by
+//! the process id of the client, so a client that gave up waiting can't be confused by an answer
+//! that arrives later.
+//!
+//! A daemon computes the status of a repository that it has nothing cached for itself, which a
+//! shell that was just started pays once per repository. The daemon exits when its shell closes the
+//! pipes, or when the shell goes away without closing them.
+//!
+//! `BASH_GIT_STATUS_SERVER_LOG` redirects the daemon's standard error into a file for debugging,
+//! and `BASH_GIT_STATUS_NO_SERVER=1` keeps the client from asking the daemon at all.
 
 use crate::cache::{self, Guard};
 use crate::status::{self, Status};
-use anyhow::{Context, Result};
-use interprocess::local_socket::{
-    GenericFilePath, ListenerOptions, Stream, ToFsName as _,
-    traits::{ListenerExt as _, Stream as _},
-};
-use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 use log::{debug, info};
-use rustix::fs::{FlockOperation, flock};
-use rustix::process::{getuid, setsid};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{FileType, fstat};
+use rustix::process::{Signal, set_parent_process_death_signal};
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{BorrowedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
-/// Protocol marker, so a client can't be fooled by a reply from an outdated
-/// daemon after the binary was rebuilt.
-const REQUEST_PREFIX: &[u8] = b"BGS1 ";
+/// Protocol marker, so a garbage line can't be taken for a request or a reply.
+const PREFIX: &str = "BGS1 ";
 
-/// How long a freshly spawned daemon gets to bind its socket.
-const SPAWN_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a client waits for the daemon before computing the status itself.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How much of a reply to hold on to; the longest one holds a branch or tag name.
+const REPLY_LIMIT: usize = 4096;
 
 /// How many statuses to remember, so a daemon that saw many repositories doesn't grow forever.
 const MAX_ENTRIES: usize = 32;
 
-type Cache = Arc<Mutex<HashMap<PathBuf, Entry>>>;
-
 enum Entry {
     /// The status of a whole repository, shared by every directory inside it and reused as long as
-    /// its [`Guard`] doesn't see a change.
+    /// its [`Guard`] doesn't see a change. The code lives in the guard's state.
     Repo {
-        code: i32,
-        guard: Arc<Guard>,
+        /// Boxed because a guard is far larger than the other variant.
+        guard: Box<Guard>,
         last_used: Instant,
     },
 
@@ -75,106 +77,88 @@ impl Entry {
     }
 }
 
-/// Run the daemon; it either exits via [`std::process::exit`] or serves forever.
+/// What the daemon remembers between requests: one entry per repository root, and one per directory
+/// that isn't inside a repository.
+type Cache = HashMap<PathBuf, Entry>;
+
+/// Run the daemon, reading requests from the standard input and answering on the standard output.
 pub fn run() -> ! {
-    let socket = socket_path();
-    let lock_path = socket.with_extension("lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open lock file {}", lock_path.display()))
-        .unwrap_or_else(|e| {
-            eprintln!("{e:#}");
-            std::process::exit(1);
-        });
+    redirect_log();
+    watch_parent();
+    info!("serving requests on the pipes");
 
-    // Any lock failure means another daemon is already running.
-    if flock(&lock_file, FlockOperation::NonBlockingLockExclusive).is_err() {
-        info!("another daemon is already running");
-        std::process::exit(0);
-    }
+    let mut cache = Cache::new();
+    let mut stdin = BufReader::new(std::io::stdin().lock());
+    let mut stdout = std::io::stdout().lock();
+    let mut request = Vec::new();
 
-    // Remove a leftover socket from a previous, uncleanly exited daemon.
-    let _ = std::fs::remove_file(&socket);
-    let listener = socket
-        .as_path()
-        .to_fs_name::<GenericFilePath>()
-        .and_then(|name| ListenerOptions::new().name(name).mode(0o600).create_sync())
-        .with_context(|| format!("failed to bind {}", socket.display()))
-        .unwrap_or_else(|e| {
-            eprintln!("{e:#}");
-            std::process::exit(1);
-        });
-    info!("listening on {}", socket.display());
-
-    let cache: Cache = Default::default();
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
-    spawn_idle_monitor(socket, Arc::clone(&last_activity));
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let cache = Arc::clone(&cache);
-                let last_activity = Arc::clone(&last_activity);
-                thread::spawn(move || {
-                    touch(&last_activity);
-                    if let Err(e) = handle(stream, &cache) {
-                        debug!("connection error: {e:#}");
-                    }
-                    touch(&last_activity);
-                });
+    loop {
+        request.clear();
+        match stdin.read_until(b'\n', &mut request) {
+            // The shell is gone, and with it whoever would read an answer.
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                debug!("failed to read a request: {e}");
+                break;
             }
-            Err(e) => debug!("accept error: {e}"),
+        }
+
+        let Some((id, ttl, cwd)) = parse_request(&request) else {
+            continue;
+        };
+
+        // Every directory of a repository shares one entry, keyed by its root.
+        let root = repo_root(&cwd);
+        let (code, text) = answer(&cwd, ttl, root.as_deref(), &mut cache);
+
+        if writeln!(stdout, "{PREFIX}{id} {code} {text}").is_err() || stdout.flush().is_err() {
+            break;
         }
     }
-    unreachable!("the accept loop handles every error")
+
+    std::process::exit(0)
 }
 
-fn handle(mut stream: Stream, cache: &Cache) -> Result<()> {
-    let mut request = Vec::new();
-    {
-        let mut reader = BufReader::new(&stream);
-        reader.read_until(b'\n', &mut request)?;
-    }
+/// Read `BGS1 <id> <ttl-ms> <path>`; anything else is ignored.
+fn parse_request(line: &[u8]) -> Option<(u32, Duration, PathBuf)> {
+    let line = line.strip_prefix(PREFIX.as_bytes())?;
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
 
-    // The request is `BGS1 <ttl-ms> <path>`; anything else is ignored.
-    let Some(rest) = request.strip_prefix(REQUEST_PREFIX) else {
-        return Ok(());
-    };
-    let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
-    let Some(space) = rest.iter().position(|b| *b == b' ') else {
-        return Ok(());
-    };
-    let Some(ttl_ms) = std::str::from_utf8(&rest[..space])
-        .ok()
-        .and_then(|ttl| ttl.parse::<u64>().ok())
-    else {
-        return Ok(());
-    };
-    let path = &rest[space + 1..];
+    let (id, rest) = split_field(line)?;
+    let (ttl, path) = split_field(rest)?;
     if path.is_empty() {
-        return Ok(());
+        return None;
     }
-    let cwd = PathBuf::from(OsStr::from_bytes(path));
 
-    // Every directory of a repository shares one entry, keyed by its root.
-    let root = repo_root(&cwd);
-    let answer = root
-        .as_deref()
-        .and_then(|root| reuse_repo(root, cache))
-        .or_else(|| reuse_dir(&cwd, cache, Duration::from_millis(ttl_ms)));
-    let (code, text) = match answer {
-        Some(answer) => answer,
-        None => {
-            let (code, text, cached) = compute(&cwd, root.as_deref());
-            remember(cache, cached.key, cached.entry);
-            (code, text)
-        }
-    };
+    Some((
+        std::str::from_utf8(id).ok()?.parse().ok()?,
+        Duration::from_millis(std::str::from_utf8(ttl).ok()?.parse().ok()?),
+        PathBuf::from(OsStr::from_bytes(path)),
+    ))
+}
 
-    stream.write_all(format!("{code}\n{text}").as_bytes())?;
-    Ok(())
+/// Split the first space-separated field off `line`.
+fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let pos = line.iter().position(|b| *b == b' ')?;
+    Some((&line[..pos], &line[pos + 1..]))
+}
+
+/// The answer for `cwd`, computed if nothing that is already remembered covers it.
+fn answer(cwd: &Path, ttl: Duration, root: Option<&Path>, cache: &mut Cache) -> (i32, String) {
+    if let Some(root) = root
+        && let Some(answer) = reuse_repo(root, cache)
+    {
+        return answer;
+    }
+
+    if let Some(answer) = reuse_dir(cwd, cache, ttl) {
+        return answer;
+    }
+
+    let (code, text, cached) = compute(cwd, root);
+    remember(cache, cached.key, cached.entry);
+    (code, text)
 }
 
 /// The root of the repository `cwd` is in, if it can be found without opening the repository.
@@ -194,42 +178,35 @@ fn repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Answer a request for a repository whose status was computed before and didn't change since.
-fn reuse_repo(root: &Path, cache: &Cache) -> Option<(i32, String)> {
-    let (code, guard) = {
-        let mut cache = cache.lock().unwrap();
-        let Some(Entry::Repo {
-            code,
-            guard,
-            last_used,
-        }) = cache.get_mut(root)
-        else {
-            return None;
-        };
-        if !guard.fresh() {
-            return None;
-        }
-        *last_used = Instant::now();
-        (*code, Arc::clone(guard))
+fn reuse_repo(root: &Path, cache: &mut Cache) -> Option<(i32, String)> {
+    let Some(Entry::Repo { guard, last_used }) = cache.get_mut(root) else {
+        return None;
     };
+    *last_used = Instant::now();
 
-    // Checking runs the expensive part without holding the lock, and only then is the answer
-    // known to be reusable.
+    // A status is only given for a limited time, see `cache::trust_window()`: what the guard
+    // checks is that the repository still looks the way it did, and the assumption that makes that
+    // sufficient is trusted again only by computing the status from scratch.
+    if !guard.fresh() {
+        return None;
+    }
+
+    // Checking runs the expensive part, and only once it is done is the answer known to be reusable.
     let code = match guard.check() {
-        cache::Verdict::Unchanged => code,
+        cache::Verdict::Unchanged => guard.code(),
         cache::Verdict::Changed => Status::Change.into(),
         cache::Verdict::Unknown => return None,
     };
 
     // The text is cheap to compute and changes without the status changing, for example when
     // another tag now points at `HEAD`.
-    status::progress_of(guard.shared())
-        .ok()
-        .map(|text| (code, text))
+    let text = status::progress_of(guard.shared()).ok()?;
+
+    Some((code, text))
 }
 
 /// Answer a request from the time-based entry for `cwd`, if there is a fresh one.
-fn reuse_dir(cwd: &Path, cache: &Cache, ttl: Duration) -> Option<(i32, String)> {
-    let cache = cache.lock().unwrap();
+fn reuse_dir(cwd: &Path, cache: &mut Cache, ttl: Duration) -> Option<(i32, String)> {
     let Some(Entry::Dir {
         code,
         text,
@@ -275,11 +252,10 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
     };
 
     let cached = match guard {
-        Some((key, guard)) => Cached {
-            key,
+        Some((root, guard)) => Cached {
+            key: root,
             entry: Entry::Repo {
-                code,
-                guard: Arc::new(guard),
+                guard: Box::new(guard),
                 last_used: Instant::now(),
             },
         },
@@ -312,8 +288,7 @@ fn without_repo(cwd: &Path) -> (i32, String, Cached) {
 }
 
 /// Keep an entry in the cache, evicting the least recently used ones beyond [`MAX_ENTRIES`].
-fn remember(cache: &Cache, key: PathBuf, entry: Entry) {
-    let mut cache = cache.lock().unwrap();
+fn remember(cache: &mut Cache, key: PathBuf, entry: Entry) {
     cache.insert(key, entry);
 
     while cache.len() > MAX_ENTRIES {
@@ -330,124 +305,142 @@ fn remember(cache: &Cache, key: PathBuf, entry: Entry) {
     }
 }
 
-/// Answer a prompt query, preferring the daemon and falling back to computing
-/// in-process when the daemon cannot be reached.
+/// Answer a prompt query, preferring the daemon of the shell and falling back to computing
+/// in-process when this shell has none.
 pub fn query_or_compute(cwd: &Path) -> (i32, String) {
     query(cwd).unwrap_or_else(|| status::compute(cwd))
 }
 
 fn query(cwd: &Path) -> Option<(i32, String)> {
-    let socket = socket_path();
-    if let Some(result) = try_query(&socket, cwd) {
-        return Some(result);
-    }
+    let request_fd = daemon_fd("BASH_GIT_STATUS_FD_IN")?;
+    let response_fd = daemon_fd("BASH_GIT_STATUS_FD_OUT")?;
 
-    // No daemon (or it is still starting): spawn one and give it a moment.
-    spawn_server();
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    loop {
-        if let Some(result) = try_query(&socket, cwd) {
-            return Some(result);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
-    let name = socket.to_fs_name::<GenericFilePath>().ok()?;
-    let mut stream = Stream::connect(name).ok()?;
-    let _ = stream.set_recv_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_send_timeout(Some(Duration::from_secs(5)));
-
-    let mut request = Vec::with_capacity(REQUEST_PREFIX.len() + 24 + cwd.as_os_str().len());
-    request.extend_from_slice(REQUEST_PREFIX);
+    let id = std::process::id();
+    let mut request = Vec::with_capacity(PREFIX.len() + 32 + cwd.as_os_str().len());
+    request.extend_from_slice(PREFIX.as_bytes());
+    request.extend_from_slice(id.to_string().as_bytes());
+    request.push(b' ');
     request.extend_from_slice(ttl().as_millis().to_string().as_bytes());
     request.push(b' ');
     request.extend_from_slice(cwd.as_os_str().as_bytes());
     request.push(b'\n');
-    stream.write_all(&request).ok()?;
+    write_all(request_fd, &request).ok()?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    let (code, text) = response.split_once('\n')?;
-    Some((code.parse().ok()?, text.to_string()))
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 256];
+    loop {
+        // Anything longer than a reply means the descriptor isn't the daemon's.
+        if pending.len() > REPLY_LIMIT {
+            return None;
+        }
+
+        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            if let Some(answer) = parse_reply(&line, id) {
+                return Some(answer);
+            }
+        }
+
+        if !readable(response_fd, deadline)? {
+            return None;
+        }
+
+        match rustix::io::read(response_fd, &mut buffer[..]) {
+            // The daemon is gone, so it won't answer.
+            Ok(0) => return None,
+            Ok(read) => pending.extend_from_slice(&buffer[..read]),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
-fn spawn_server() {
-    let Ok(exe) = std::env::current_exe() else {
+/// Read `BGS1 <id> <code> <text>`, or `None` for a reply to another request.
+fn parse_reply(line: &[u8], id: u32) -> Option<(i32, String)> {
+    let line = line.strip_prefix(PREFIX.as_bytes())?;
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+
+    let (reply_id, rest) = split_field(line)?;
+    if reply_id != id.to_string().as_bytes() {
+        return None;
+    }
+
+    let (code, text) = split_field(rest)?;
+    Some((
+        std::str::from_utf8(code).ok()?.parse().ok()?,
+        String::from_utf8_lossy(text).into_owned(),
+    ))
+}
+
+/// The descriptor the shell wired to the daemon, if it did.
+///
+/// `contrib/bash-git-status.bash` exports the numbers of the pipes it started the daemon with; the
+/// check that they are pipes keeps a stray descriptor from being written to or waited on.
+fn daemon_fd(name: &str) -> Option<BorrowedFd<'static>> {
+    let number = std::env::var(name).ok()?.parse::<RawFd>().ok()?;
+    if number < 0 {
+        return None;
+    }
+
+    // SAFETY: the descriptor belongs to the shell and outlives this process, which only borrows it.
+    let fd = unsafe { BorrowedFd::borrow_raw(number) };
+    (FileType::from_raw_mode(fstat(fd).ok()?.st_mode) == FileType::Fifo).then_some(fd)
+}
+
+fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(written) => bytes = &bytes[written..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
+/// Wait for the daemon to answer, `false` if it took it longer than [`RESPONSE_TIMEOUT`].
+fn readable(fd: BorrowedFd<'_>, deadline: Instant) -> Option<bool> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout = Timespec {
+        tv_sec: left.as_secs().try_into().ok()?,
+        tv_nsec: left.subsec_nanos().into(),
+    };
+
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    poll(&mut fds, Some(&timeout)).ok().map(|ready| ready > 0)
+}
+
+/// Move the log to the file the environment asks for, as it would otherwise be written to the
+/// shell's terminal, where it would appear in the prompt.
+fn redirect_log() {
+    let Some(path) = std::env::var_os("BASH_GIT_STATUS_SERVER_LOG") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
 
-    let mut command = Command::new(exe);
-    command
-        .arg("--server")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
-
-    match std::env::var_os("BASH_GIT_STATUS_SERVER_LOG") {
-        Some(log) => match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-        {
-            Ok(file) => {
-                command.stderr(Stdio::from(file));
-            }
-            Err(_) => {
-                command.stderr(Stdio::null());
-            }
-        },
-        None => {
-            command.stderr(Stdio::null());
-        }
-    }
-
-    // SAFETY: `setsid` is async-signal-safe and does not allocate.
-    unsafe {
-        command.pre_exec(|| setsid().map(|_| ()).map_err(std::io::Error::from));
-    }
-
-    let _ = command.spawn();
+    let _ = rustix::stdio::dup2_stderr(&file);
 }
 
-fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("bash-git-status.sock"),
-        _ => {
-            let uid = getuid().as_raw();
-            PathBuf::from(format!("/tmp/bash-git-status-{uid}.sock"))
-        }
+/// Exit with the shell that started us, which the pipes alone don't notice while one of the shell's
+/// background jobs keeps them open.
+fn watch_parent() {
+    if set_parent_process_death_signal(Some(Signal::TERM)).is_err() {
+        debug!("failed to watch the parent process");
     }
-}
-
-fn touch(last_activity: &Mutex<Instant>) {
-    *last_activity.lock().unwrap() = Instant::now();
-}
-
-fn spawn_idle_monitor(socket: PathBuf, last_activity: Arc<Mutex<Instant>>) {
-    let idle = idle_timeout();
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(1));
-            if last_activity.lock().unwrap().elapsed() >= idle {
-                let _ = std::fs::remove_file(&socket);
-                info!("idle for {idle:?}, exiting");
-                std::process::exit(0);
-            }
-        }
-    });
 }
 
 /// The freshness window requested by the client for a cache hit.
 fn ttl() -> Duration {
     Duration::from_millis(env_u64("BASH_GIT_STATUS_TTL_MS", 500))
-}
-
-fn idle_timeout() -> Duration {
-    Duration::from_secs(env_u64("BASH_GIT_STATUS_IDLE_SECS", 600))
 }
 
 pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
