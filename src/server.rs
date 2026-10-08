@@ -36,9 +36,37 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Protocol marker, so a client can't be fooled by a reply from an outdated
-/// daemon after the binary was rebuilt.
-const REQUEST_PREFIX: &[u8] = b"BGS1 ";
+/// Protocol marker, so a client can't be fooled by a reply from an outdated daemon after the
+/// binary was rebuilt, and so that a request can't be taken for a reply.
+const PREFIX: &[u8] = b"BGS2 ";
+
+/// The longest directory a request may ask about; a path that doesn't exist is longer than it can
+/// be, and the length is what a client states rather than what it sent.
+const MAX_PATH: usize = 8 * 1024;
+
+/// The environment overrides that decide which repository a directory belongs to and what its
+/// status is: `git` and the library honour them, so a daemon that was started by another shell -
+/// with another idea of both - can't answer for a shell that has one of them set.
+const ENVIRONMENT_OVERRIDES: [&str; 18] = [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_ATTR_SYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
 
 /// How long a freshly spawned daemon gets to bind its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -77,6 +105,8 @@ impl Entry {
 
 /// Run the daemon; it either exits via [`std::process::exit`] or serves forever.
 pub fn run() -> ! {
+    drop_environment_overrides();
+
     let socket = socket_path();
     let lock_path = socket.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
@@ -132,39 +162,76 @@ pub fn run() -> ! {
     unreachable!("the accept loop handles every error")
 }
 
-fn handle(mut stream: Stream, cache: &Cache) -> Result<()> {
-    let mut request = Vec::new();
-    {
-        let mut reader = BufReader::new(&stream);
-        reader.read_until(b'\n', &mut request)?;
+/// The name of an environment override that is set, if there is one.
+fn environment_override(set: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<&'static str> {
+    ENVIRONMENT_OVERRIDES
+        .iter()
+        .copied()
+        .find(|name| set(name).is_some())
+}
+
+/// Remove the overrides a daemon must not answer with, see [`ENVIRONMENT_OVERRIDES`].
+///
+/// The clients that need one of them compute the status themselves, so removing them can't take an
+/// answer away from anyone: it only keeps a daemon that was started with `GIT_DIR` - by hand, or by
+/// an older client - from answering with that repository for every other client.
+fn drop_environment_overrides() {
+    for name in ENVIRONMENT_OVERRIDES {
+        // SAFETY: nothing else has run yet, so no thread can read the environment concurrently.
+        unsafe { std::env::remove_var(name) };
+    }
+}
+
+/// Read a request, which is `BGS2 <ttl-ms> <len>` followed by that many bytes of a directory.
+///
+/// The path is sent as its length instead of being terminated: a directory whose name contains a
+/// newline is then still the directory that was asked about, and not a prefix of it that happens to
+/// be another repository.
+fn read_request(reader: &mut impl BufRead) -> Result<Option<(Duration, PathBuf)>> {
+    let mut header = Vec::new();
+    if reader.read_until(b'\n', &mut header)? == 0 {
+        return Ok(None);
     }
 
-    // The request is `BGS1 <ttl-ms> <path>`; anything else is ignored.
-    let Some(rest) = request.strip_prefix(REQUEST_PREFIX) else {
-        return Ok(());
+    let Some(rest) = header.strip_prefix(PREFIX) else {
+        return Ok(None);
     };
     let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
     let Some(space) = rest.iter().position(|b| *b == b' ') else {
-        return Ok(());
+        return Ok(None);
     };
-    let Some(ttl_ms) = std::str::from_utf8(&rest[..space])
-        .ok()
-        .and_then(|ttl| ttl.parse::<u64>().ok())
-    else {
-        return Ok(());
+    let parse = |field: &[u8]| std::str::from_utf8(field).ok()?.parse::<u64>().ok();
+    let (Some(ttl), Some(len)) = (parse(&rest[..space]), parse(&rest[space + 1..])) else {
+        return Ok(None);
     };
-    let path = &rest[space + 1..];
-    if path.is_empty() {
-        return Ok(());
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(None);
+    };
+    if len == 0 || len > MAX_PATH {
+        return Ok(None);
     }
-    let cwd = PathBuf::from(OsStr::from_bytes(path));
+
+    let mut path = vec![0u8; len];
+    reader.read_exact(&mut path)?;
+
+    Ok(Some((
+        Duration::from_millis(ttl),
+        PathBuf::from(OsStr::from_bytes(&path)),
+    )))
+}
+
+fn handle(mut stream: Stream, cache: &Cache) -> Result<()> {
+    let mut reader = BufReader::new(&stream);
+    let Some((ttl, cwd)) = read_request(&mut reader)? else {
+        return Ok(());
+    };
 
     // Every directory of a repository shares one entry, keyed by its root.
     let root = repo_root(&cwd);
     let answer = root
         .as_deref()
         .and_then(|root| reuse_repo(root, cache))
-        .or_else(|| reuse_dir(&cwd, cache, Duration::from_millis(ttl_ms)));
+        .or_else(|| reuse_dir(&cwd, cache, ttl));
     let (code, text) = match answer {
         Some(answer) => answer,
         None => {
@@ -174,7 +241,12 @@ fn handle(mut stream: Stream, cache: &Cache) -> Result<()> {
         }
     };
 
-    stream.write_all(format!("{code}\n{text}").as_bytes())?;
+    let mut reply = Vec::with_capacity(PREFIX.len() + 16 + text.len());
+    reply.extend_from_slice(PREFIX);
+    reply.extend_from_slice(code.to_string().as_bytes());
+    reply.push(b'\n');
+    reply.extend_from_slice(text.as_bytes());
+    stream.write_all(&reply)?;
     Ok(())
 }
 
@@ -341,6 +413,13 @@ pub fn query_or_compute(cwd: &Path) -> (i32, String) {
 }
 
 fn query(cwd: &Path) -> Option<(i32, String)> {
+    // A shell that says where its repository is can't be answered by a daemon that was started by
+    // one that didn't, so it computes the status itself.
+    if let Some(name) = environment_override(|name| std::env::var_os(name)) {
+        debug!("{name} is set, computing in-process");
+        return None;
+    }
+
     let socket = socket_path();
     if let Some(result) = try_query(&socket, cwd) {
         return Some(result);
@@ -366,18 +445,28 @@ fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
     let _ = stream.set_recv_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_send_timeout(Some(Duration::from_secs(5)));
 
-    let mut request = Vec::with_capacity(REQUEST_PREFIX.len() + 24 + cwd.as_os_str().len());
-    request.extend_from_slice(REQUEST_PREFIX);
+    let path = cwd.as_os_str().as_bytes();
+    let mut request = Vec::with_capacity(PREFIX.len() + 24 + path.len());
+    request.extend_from_slice(PREFIX);
     request.extend_from_slice(ttl().as_millis().to_string().as_bytes());
     request.push(b' ');
-    request.extend_from_slice(cwd.as_os_str().as_bytes());
+    request.extend_from_slice(path.len().to_string().as_bytes());
     request.push(b'\n');
+    request.extend_from_slice(path);
     stream.write_all(&request).ok()?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    let (code, text) = response.split_once('\n')?;
-    Some((code.parse().ok()?, text.to_string()))
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+
+    // A daemon of an older build answers in its own protocol; computing in-process is better than
+    // reading that answer as this one.
+    let response = response.strip_prefix(PREFIX)?;
+    let newline = response.iter().position(|b| *b == b'\n')?;
+    let (code, text) = response.split_at(newline);
+    Some((
+        std::str::from_utf8(code).ok()?.parse().ok()?,
+        String::from_utf8(text[1..].to_vec()).ok()?,
+    ))
 }
 
 fn spawn_server() {

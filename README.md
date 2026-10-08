@@ -15,13 +15,22 @@ its directories, and reuses it until the repository changes: the index (`git add
 added, removed or made executable, and untracked files that appeared or vanished. A directory inside
 a huge repository therefore answers in a few milliseconds instead of scanning the worktree again.
 
-Detecting a change this way means no directory walk, no ignore matching and no tree traversal: only
-the mtime and inode of every directory that held a tracked or untracked file, and the stat
-information the index recorded for every tracked file, are checked again. A file counts as unchanged
-when its size, timestamps and inode are still the ones the index wrote down for it, compared down to
-nanoseconds the way `git status` compares them, so a file written in the same second as the index
-doesn't have to be read to be trusted; whatever that comparison can't decide is left to the full
-index-to-worktree comparison of gitoxide.
+Detecting a change this way means no scan when nothing changed: the mtime and inode of every
+directory a scan would descend into are checked again, and so are the stat information the index
+recorded for every tracked file. A file counts as unchanged when its size, timestamps and inode are
+still the ones the index wrote down for it, compared down to nanoseconds the way `git status`
+compares them, so a file written in the same second as the index doesn't have to be read to be
+trusted; whatever that comparison can't decide is left to the full index-to-worktree comparison of
+gitoxide.
+
+The watched directories are the ones the scan enters, which - next to the directories that hold a
+file - includes those that hold none: a file created in an empty directory, or in one whose contents
+are all ignored, changes the mtime of a directory that is watched. Directories that are ignored
+themselves are left out, as anything that can be created in them is ignored as well. Editing an
+ignore rule doesn't change any directory, so the files that decide what a scan reports are watched
+too: the `.gitignore` and `.gitattributes` next to every watched directory, `info/exclude` and
+`info/attributes` of the repository, the configuration that selects the global rule file, and that
+file wherever it is.
 
 An entry is still only served for `BASH_GIT_STATUS_TRUST_SECS` (default 60) before the status is
 computed from scratch again, which bounds the effect of filesystems that don't update directory
@@ -36,7 +45,12 @@ any repository are kept for `BASH_GIT_STATUS_TTL_MS` (default 500).
   inactivity; kill it early with `pkill -x bash-git-status`.
 - A lock file next to the socket keeps concurrent clients from spawning duplicates, and a stale
   socket left by an unclean exit is replaced. Starting a daemon always starts from a fresh state,
-  but a daemon of an older build answers with its old behaviour until it exits.
+  and both directions of the protocol carry its version, so a client that finds a daemon of an older
+  build computes the status itself instead of reading its older answer.
+- A shell that sets an environment override which changes what a status means - `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`, `GIT_NAMESPACE` and the rest - computes the
+  status in-process, because the daemon was started by another shell and has another environment.
+  The daemon drops those overrides when it starts, so it never answers another shell's repository.
 - When no daemon can be reached, `bash-git-status` computes the status in-process, which is the
   historical behaviour and the fallback at every step.
 - `BASH_GIT_STATUS_NO_SERVER=1` disables the daemon entirely.
