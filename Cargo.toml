@@ -25,6 +25,7 @@ clap = { version = "4", default-features = false, features = [
     "error-context",
     "derive",
 ] }
+rayon = "1"
 
 [profile.release]
 lto = "thin"

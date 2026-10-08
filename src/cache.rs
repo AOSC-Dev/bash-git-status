@@ -27,12 +27,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use gix::ThreadSafeRepository;
+use rayon::prelude::*;
 
 use crate::server::env_u64;
 use crate::status::{self, Status};
 
 /// How many directories can be watched before a repository is considered too large to watch.
 const MAX_WATCHED_DIRS: usize = 64 * 1024;
+
+/// Below this many items a check runs in the thread that asked for it: waking up another one costs
+/// more than the `stat` calls it would take over.
+const PARALLEL_THRESHOLD: usize = 64;
 
 /// How a cached status fares against the current state of its repository.
 pub enum Verdict {
@@ -196,12 +201,13 @@ impl Guard {
         let index_time = (written_at.unix_seconds(), written_at.nanoseconds());
         let is_racy = |mtime: gix::index::entry::stat::Time| is_racy(index_time, mtime);
 
-        par_map(index.entries(), |entry| {
-            entry_state(entry, &index, workdir, &is_racy)
-        })
-        .into_iter()
-        .max()
-        .unwrap_or(Tracked::Unchanged)
+        index
+            .entries()
+            .par_iter()
+            .with_min_len(PARALLEL_THRESHOLD)
+            .map(|entry| entry_state(entry, &index, workdir, &is_racy))
+            .max()
+            .unwrap_or(Tracked::Unchanged)
     }
 
     /// The exact answer, for the entries [`tracked_files()`](Self::tracked_files()) can't judge.
@@ -457,7 +463,12 @@ fn watch_dirs(shared: &ThreadSafeRepository, report: &status::Report) -> Option<
         .collect();
     dirs.sort();
 
-    Some(par_map(&dirs, |dir| FileStamp::read(dir)))
+    Some(
+        dirs.par_iter()
+            .with_min_len(PARALLEL_THRESHOLD)
+            .map(FileStamp::read)
+            .collect(),
+    )
 }
 
 /// Add every directory above `path` to `rel`.
@@ -471,41 +482,9 @@ fn insert_parents(rel: &mut HashSet<Vec<u8>>, path: &[u8]) {
 }
 
 fn dirs_unchanged(dirs: &[FileStamp]) -> bool {
-    par_map(dirs, FileStamp::dir_matches)
-        .into_iter()
-        .all(std::convert::identity)
-}
-
-/// Apply `f` to every item, using all available cores.
-fn par_map<T, U>(items: &[T], f: impl Fn(&T) -> U + Sync) -> Vec<U>
-where
-    T: Sync,
-    U: Send,
-{
-    /// Fewer items than this per thread don't pay for the thread that would run them.
-    const PER_THREAD: usize = 256;
-
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let threads = threads.min(items.len().div_ceil(PER_THREAD)).max(1);
-    let chunk = items.len().div_ceil(threads);
-    if chunk == 0 {
-        return Vec::new();
-    }
-    if threads == 1 {
-        return items.iter().map(f).collect();
-    }
-
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = items
-            .chunks(chunk)
-            .map(|chunk| scope.spawn(|| chunk.iter().map(&f).collect::<Vec<_>>()))
-            .collect();
-
-        workers
-            .into_iter()
-            .flat_map(|worker| worker.join().expect("mapping doesn't panic"))
-            .collect()
-    })
+    dirs.par_iter()
+        .with_min_len(PARALLEL_THRESHOLD)
+        .all(FileStamp::dir_matches)
 }
 
 /// How long a guard may be used without re-verifying the assumption that directory mtimes change
