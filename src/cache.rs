@@ -450,36 +450,74 @@ fn stamp_of(metadata: &std::fs::Metadata) -> (SystemTime, u64, u64) {
     )
 }
 
-/// The files to watch to notice `HEAD` moving: the reference it points at, and `packed-refs` as
-/// the other place a reference can live.
+/// The files to watch to notice `HEAD` moving: every reference from `HEAD` to the one that holds
+/// the commit, and `packed-refs` as the other place a reference can be stored.
 ///
 /// Without them, change detection would keep answering with the old status when commits are made or
-/// the branch is switched. A reference backend that keeps references somewhere else (reftable) has
-/// nothing to watch and gets no guard at all.
+/// the branch is switched. A reference can name another reference, so the chain is followed to its
+/// end, where a reference that doesn't exist is watched as a missing file - which is how a branch
+/// that is created later is noticed. A chain that leads in a circle is watched in full, and one
+/// that is longer than [`MAX_LINKS`](head_stamps::MAX_LINKS) leaves the repository unwatched, as
+/// does a reference backend that keeps references somewhere else (reftable).
 fn head_stamps(git_dir: &Path, common_dir: &Path) -> Option<Vec<FileStamp>> {
-    let head = git_dir.join("HEAD");
-    let content = std::fs::read(&head).ok()?;
-    let content = content.strip_suffix(b"\n").unwrap_or(&content);
+    /// How many references a chain may have, which also bounds one that leads in a circle.
+    const MAX_LINKS: usize = 16;
 
-    let Some(name) = content.strip_prefix(b"ref: ") else {
-        // A detached HEAD stores the commit id itself, and that file is watched already.
+    let head = git_dir.join("HEAD");
+    let packed = common_dir.join("packed-refs");
+
+    // A detached HEAD stores the commit id itself, and that file is watched already.
+    let Some(mut name) = symbolic_target(&head) else {
         return Some(Vec::new());
     };
-    let name = Path::new(OsStr::from_bytes(name));
+
+    let mut stamps = Vec::new();
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(name.clone()) {
+            break;
+        }
+        if stamps.len() == MAX_LINKS {
+            return None;
+        }
+
+        let reference = common_dir.join(&name);
+        let next = symbolic_target(&reference);
+        stamps.push(FileStamp::read(reference));
+
+        match next {
+            Some(next) => name = next,
+            None => break,
+        }
+    }
+
+    // Both places a reference can be stored are watched: committing on a packed branch creates the
+    // loose file, and packing references updates `packed-refs`. Where there is neither, the
+    // references live somewhere else and there is nothing to watch.
+    if stamps.iter().all(|stamp| stamp.state.is_none()) && packed.symlink_metadata().is_err() {
+        return None;
+    }
+
+    stamps.push(FileStamp::read(packed));
+    Some(stamps)
+}
+
+/// The reference a file of `refs` names, if it holds a symbolic reference.
+///
+/// `None` for a file that holds a commit id, and for one that is not there: a reference that doesn't
+/// exist yet, as a branch without commits has, is watched as a missing file.
+fn symbolic_target(path: &Path) -> Option<PathBuf> {
+    let content = std::fs::read(path).ok()?;
+    let content = content.strip_suffix(b"\n").unwrap_or(&content);
+    let name = Path::new(OsStr::from_bytes(content.strip_prefix(b"ref: ")?));
+
+    // A reference names a path below `refs/`, which is never absolute and never climbs out of the
+    // directory the references are stored in.
     if name.is_absolute() || name.components().any(|c| matches!(c, Component::ParentDir)) {
         return None;
     }
 
-    // References live next to the common directory, as linked worktrees share them. Both places a
-    // reference can be stored are watched: committing on a packed branch creates the loose file,
-    // and packing references updates `packed-refs`.
-    let loose = common_dir.join(name);
-    let packed = common_dir.join("packed-refs");
-    if loose.symlink_metadata().is_err() && packed.symlink_metadata().is_err() {
-        return None;
-    }
-
-    Some(vec![FileStamp::read(loose), FileStamp::read(packed)])
+    Some(name.to_owned())
 }
 
 /// A worktree walk that records the directories it descends into.
@@ -893,6 +931,28 @@ mod tests {
 
         let guard = repo.capture();
         std::fs::write(&target, "*.txt\ttext\n").expect("the rule can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_branch_behind_a_reference_is_noticed() {
+        let repo = TempRepo::new("aliased-head");
+        let git_dir = repo.path.join(".git");
+        std::fs::create_dir_all(git_dir.join("refs/heads")).expect("the directory can be created");
+        std::fs::write(git_dir.join("refs/heads/alias"), "ref: refs/heads/main\n")
+            .expect("the alias can be written");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/alias\n")
+            .expect("HEAD can be pointed at the alias");
+
+        let guard = repo.capture();
+
+        // The branch the alias finally points at, updated where the alias itself doesn't change.
+        std::fs::write(
+            git_dir.join("refs/heads/main"),
+            format!("{}\n", "b".repeat(40)),
+        )
+        .expect("the branch can be updated");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
