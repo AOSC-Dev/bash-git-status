@@ -27,14 +27,15 @@ The watched directories are the ones the scan enters, which - next to the direct
 file - includes those that hold none: a file created in an empty directory, or in one whose contents
 are all ignored, changes the mtime of a directory that is watched. Directories that are ignored
 themselves are left out, as anything that can be created in them is ignored as well. Editing an
-ignore rule doesn't change any directory, so the files that decide what a scan reports are watched
-too: the `.gitignore` and `.gitattributes` that exist next to every watched directory, `info/exclude`
-and `info/attributes` of the repository, the global rule file wherever `core.excludesFile` points,
-and the configuration itself - the repository's, the user's and the system's, together with the
-files their `include.path` says to read, since what those contain is read as if it were written in
-the file that includes them. Watching a rule file or a configuration file that doesn't exist isn't
-needed, because creating one changes the mtime of the directory that holds it; a file that an
-`include.path` points at is watched whether or not it is conditional or there.
+ignore or attributes rule doesn't change any directory, so the files that decide what a scan reports
+are watched too: the `.gitignore` and `.gitattributes` that exist next to every watched directory,
+`info/exclude` and `info/attributes` of the repository, the rule files `core.excludesFile` and
+`core.attributesFile` point at together with the user's and the system's defaults, and the
+configuration itself - the repository's, the user's and the system's, with the files their
+`include.path` says to read, since what those contain is read as if it were written in the file that
+includes them. Watching a rule file or a configuration file that doesn't exist isn't needed, because
+creating one changes the mtime of the directory that holds it; a file that an `include.path` points
+at is watched whether or not it is conditional or there.
 
 An entry is still only served for `BASH_GIT_STATUS_TRUST_SECS` (default 60) before the status is
 computed from scratch again, which bounds the effect of filesystems that don't update directory
