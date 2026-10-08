@@ -380,45 +380,30 @@ pub(crate) struct FileStamp {
     pub(crate) path: PathBuf,
     /// `None` if the file doesn't exist or can't be inspected.
     pub(crate) state: Option<(SystemTime, u64, u64)>,
-    /// The same, of what `path` points at when it is a symbolic link, and of what that points at in
-    /// turn.
+    /// The same, of what the path points at if it is a symbolic link, however long the chain.
     ///
-    /// A rule or a configuration file is read through the link, so changing the file at the end of
-    /// it changes the answer while the link itself stays as it was - and a link can point at
-    /// another link. A file at the end of a link that isn't there is watched as a missing one, so
-    /// that it appearing is noticed as well.
-    pub(crate) target: Option<Box<FileStamp>>,
+    /// A rule or a configuration file is read through a link, so a change in the file at the end of
+    /// it changes the answer while the link itself stays as it was. A link that can't be resolved -
+    /// broken, or leading back to itself - is recorded as a missing file, which is what a direct
+    /// computation is told as well: the kernel is what resolves them for both.
+    pub(crate) followed: Option<(SystemTime, u64, u64)>,
 }
 
 impl FileStamp {
-    /// Record `path` with the metadata it has now, and what a link of it points at.
+    /// Record `path` with the metadata it has now, and, if it is a symbolic link, with the metadata
+    /// of what it points at, resolved by the kernel the way `git` resolves it.
     fn read(path: impl Into<PathBuf>) -> FileStamp {
-        FileStamp::read_depth(path.into(), 0)
-    }
-
-    /// `depth` bounds following a link that leads back to itself.
-    fn read_depth(path: PathBuf, depth: usize) -> FileStamp {
-        /// How many links to follow, like the kernel does before giving up.
-        const MAX_DEPTH: usize = 8;
-
-        let metadata = std::fs::symlink_metadata(&path).ok();
-        let target = metadata
+        let path = path.into();
+        let state = std::fs::symlink_metadata(&path).ok();
+        let followed = state
             .as_ref()
-            .filter(|metadata| metadata.is_symlink() && depth < MAX_DEPTH)
-            .and_then(|_| std::fs::read_link(&path).ok())
-            .map(|target| {
-                let target = match target.is_absolute() {
-                    true => target,
-                    false => path.parent().unwrap_or(Path::new("")).join(target),
-                };
-
-                Box::new(FileStamp::read_depth(target, depth + 1))
-            });
+            .filter(|state| state.is_symlink())
+            .and_then(|_| std::fs::metadata(&path).ok());
 
         FileStamp {
-            state: metadata.as_ref().map(stamp_of),
+            state: state.as_ref().map(stamp_of),
             path,
-            target,
+            followed: followed.as_ref().map(stamp_of),
         }
     }
 
@@ -890,6 +875,31 @@ mod tests {
         std::fs::write(&target, "*.txt\t-text\n").expect("the rule can be written");
         let link = repo.path.join("attributes");
         std::os::unix::fs::symlink(&target, &link).expect("the rule can be linked to");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!("[core]\n\tattributesFile = {}\n", link.display()));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&target, "*.txt\ttext\n").expect("the rule can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_change_behind_a_long_link_chain_is_noticed() {
+        let repo = TempRepo::new("deep-linked-attributes");
+        let target = repo.path.join("attributes.target");
+        std::fs::write(&target, "*.txt\t-text\n").expect("the rule can be written");
+
+        // A chain longer than any limit we could pick, which the kernel resolves all the same.
+        let mut link = target.clone();
+        for level in 0..12 {
+            let next = repo.path.join(format!("attributes.{level}"));
+            std::os::unix::fs::symlink(&link, &next).expect("the rule can be linked to");
+            link = next;
+        }
+
         let config = repo.path.join(".git/config");
         let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
         content.push_str(&format!("[core]\n\tattributesFile = {}\n", link.display()));
