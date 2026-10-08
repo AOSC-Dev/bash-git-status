@@ -112,11 +112,6 @@ impl Guard {
         })
     }
 
-    /// The exit code of the status the guard was captured for.
-    pub fn code(&self) -> i32 {
-        self.code
-    }
-
     /// Whether the guard may still be used, see [`trust_window()`].
     pub fn fresh(&self) -> bool {
         self.created.elapsed() < trust_window()

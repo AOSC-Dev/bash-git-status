@@ -3,20 +3,17 @@ bash-git-status
 
 A simple program to display Git status, useful for integration in Bash's PS1 prompt.
 
-Status daemon
+Status server
 -------------
 
-Loading [contrib/bash-git-status.bash](contrib/bash-git-status.bash) from your bashrc gives every
-shell its own status daemon, which the prompt then asks over two pipes instead of computing the
-status itself:
-
-    source /usr/share/bash-git-status/bash-git-status.bash   # or /etc/bashrc.d/ on AOSC OS
-
-The daemon caches one result per repository, shared by all of its directories, and reuses it until
-the repository changes: the index (`git add`, `git commit`, `git reset`), `HEAD` (checkouts,
-commits, in-progress operations), tracked files that were modified, added, removed or made
-executable, and untracked files that appeared or vanished. A directory inside a huge repository
-therefore answers in a few milliseconds instead of scanning the worktree again.
+By default the status is served by a small per-user daemon (a unix socket in `$XDG_RUNTIME_DIR`,
+`/tmp` when it isn't set). It starts on demand - the first `bash-git-status` call spawns it and
+waits for it to bind - and every shell asks the same one, so a repository another shell already
+looked at is answered from its cache. The daemon caches one result per repository, shared by all of
+its directories, and reuses it until the repository changes: the index (`git add`, `git commit`,
+`git reset`), `HEAD` (checkouts, commits, in-progress operations), tracked files that were modified,
+added, removed or made executable, and untracked files that appeared or vanished. A directory inside
+a huge repository therefore answers in a few milliseconds instead of scanning the worktree again.
 
 Detecting a change this way means no directory walk, no ignore matching and no tree traversal: only
 the mtime and inode of every directory that held a tracked or untracked file, and the stat
@@ -35,16 +32,16 @@ don't. Repositories that can't be watched this way (a sparse index, a reference 
 reference files, or more directories than the daemon is willing to watch) and directories outside
 any repository are kept for `BASH_GIT_STATUS_TTL_MS` (default 500).
 
-Each shell has a daemon of its own and nothing is shared between them, so a status is remembered for
-as long as that shell lives. A shell that is started later pays one scan of the repository it asks
-about first, and everything after that is answered from its own cache.
-
-- Without the integration script, and with `BASH_GIT_STATUS_NO_SERVER=1`, `bash-git-status` computes
-  the status in-process, which is the historical behaviour and the fallback whenever the daemon
-  can't be reached.
-- A daemon lives as long as the shell that started it; `_bgs_stop` in the integration script stops it
-  early, and the next prompt starts a new one.
-- `BASH_GIT_STATUS_TRUST_SECS` bounds how long a status may be served before it is computed again.
+- The daemon starts on demand and exits after `BASH_GIT_STATUS_IDLE_SECS` (default 600) of
+  inactivity; kill it early with `pkill -x bash-git-status`.
+- A lock file next to the socket keeps concurrent clients from spawning duplicates, and a stale
+  socket left by an unclean exit is replaced. Starting a daemon always starts from a fresh state,
+  but a daemon of an older build answers with its old behaviour until it exits.
+- When no daemon can be reached, `bash-git-status` computes the status in-process, which is the
+  historical behaviour and the fallback at every step.
+- `BASH_GIT_STATUS_NO_SERVER=1` disables the daemon entirely.
+- `BASH_GIT_STATUS_TRUST_SECS` bounds how long a status may be served before the status is computed
+  again.
 - `BASH_GIT_STATUS_TTL_MS` is the freshness window for repositories and directories that can't be
   watched for changes.
 - `BASH_GIT_STATUS_SERVER_LOG=<file>` appends the daemon's log output to a file, which with

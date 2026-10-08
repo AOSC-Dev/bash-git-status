@@ -1,10 +1,12 @@
 //! A bash prompt helper printing the current branch (or in-progress operation)
 //! and exiting with a code describing the worktree state.
 //!
-//! Statuses are served by a small daemon per shell, over pipes the shell keeps open (see
-//! `src/server.rs` and `contrib/bash-git-status.bash`): entries of a repository are answered
-//! instantly as long as it didn't change (see `src/cache.rs`). Without the shell integration, or
-//! with `BASH_GIT_STATUS_NO_SERVER=1`, every call computes the status in-process.
+//! By default the status comes from a small per-user daemon over a unix
+//! socket (see `src/server.rs`): entries of a repository are answered
+//! instantly as long as it didn't change (see `src/cache.rs`), and are
+//! otherwise recomputed before the reply. The daemon starts on demand and
+//! exits after `BASH_GIT_STATUS_IDLE_SECS` (default 600) of inactivity.
+//! `BASH_GIT_STATUS_NO_SERVER=1` always computes in-process instead.
 
 mod cache;
 mod server;
@@ -19,7 +21,7 @@ use std::process::exit;
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
-    /// Run the status-caching daemon, which the shell starts and talks to over pipes.
+    /// Run the status-caching daemon; the client spawns it on demand.
     #[arg(long, hide = true)]
     server: bool,
 }
