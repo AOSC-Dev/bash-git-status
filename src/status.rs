@@ -288,7 +288,7 @@ pub fn progress_of(shared: &ThreadSafeRepository) -> Result<String> {
             InProgress::RevertSequence => format!("Revert Sequence progress {display_name}"),
         }
     } else {
-        display_name.to_string()
+        display_name
     };
 
     Ok(s)
