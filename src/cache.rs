@@ -91,11 +91,15 @@ enum Tracked {
 }
 
 impl Guard {
-    /// Record the state of the repository that `report` was computed for.
+    /// Record what can be recorded before the status that is to be guarded is computed.
+    ///
+    /// Everything here is read before the status scan starts, so that a change made while it runs
+    /// can't be recorded as one the status already reflects - which would leave the guard looking
+    /// valid for a status that was computed before the change.
     ///
     /// Returns `None` if the repository can't be watched for changes reliably, in which case the
     /// caller has to compute its status again for every request.
-    pub fn capture(repo: &status::Repo, report: &status::Report, watch: Watch) -> Option<Guard> {
+    pub fn record(repo: &status::Repo) -> Option<Recorded> {
         let shared = &repo.repo;
         let tl = shared.to_thread_local();
         let git_dir = tl.git_dir().to_owned();
@@ -118,24 +122,38 @@ impl Guard {
         }
         fingerprint.push(FileStamp::read(git_dir.join("commondir")));
 
-        let dirs = watch.dirs()?;
         let config = tl.config_snapshot();
         let excluding = config.trusted_path("core.excludesFile").ok().flatten();
         let attributing = config.trusted_path("core.attributesFile").ok().flatten();
 
-        Some(Guard {
-            repo: shared.clone(),
-            code: report.status.into(),
-            staged: report.staged,
+        Some(Recorded {
             fingerprint,
             rules: rule_stamps(
                 &git_dir,
                 tl.common_dir(),
-                &dirs,
                 excluding.as_deref(),
                 attributing.as_deref(),
             )?,
-            dirs: stamp_all(&dirs),
+        })
+    }
+
+    /// Record the state of the repository that `report` was computed for.
+    pub fn capture(
+        repo: &status::Repo,
+        report: &status::Report,
+        recorded: Recorded,
+        watch: Watch,
+    ) -> Option<Guard> {
+        let (dirs, mut rules) = watch.stamps()?;
+        rules.extend(recorded.rules);
+
+        Some(Guard {
+            repo: repo.repo.clone(),
+            code: report.status.into(),
+            staged: report.staged,
+            fingerprint: recorded.fingerprint,
+            rules,
+            dirs,
             created: Instant::now(),
         })
     }
@@ -520,11 +538,27 @@ fn symbolic_target(path: &Path) -> Option<PathBuf> {
     Some(name.to_owned())
 }
 
-/// A worktree walk that records the directories it descends into.
+/// What [`Guard::record()`] recorded before the status it guards was computed.
+pub struct Recorded {
+    fingerprint: Vec<FileStamp>,
+    rules: Vec<FileStamp>,
+}
+
+/// A worktree walk that records the directories it descends into, and stamps them as soon as it
+/// has them.
 ///
-/// It is started before the status of a repository is computed and read afterwards, because both
-/// walk the worktree and the operating system can do that on two cores at once.
-pub struct Watch(Option<std::thread::JoinHandle<Option<Vec<PathBuf>>>>);
+/// It is started before the status of a repository is computed, because both walk the worktree and
+/// the operating system can do that on two cores at once, and it stamps the directories while that
+/// scan is still running: the later a directory is stamped, the more likely the stamp is of a
+/// change the scan hasn't seen, which would leave the guard looking valid for a status that was
+/// computed before the change.
+pub struct Watch(Option<std::thread::JoinHandle<Option<Stamped>>>);
+
+/// The directories of a worktree and the rule files beside them, with what they looked like.
+struct Stamped {
+    dirs: Vec<FileStamp>,
+    rules: Vec<FileStamp>,
+}
 
 impl Watch {
     /// Start recording the directories of `shared`'s worktree.
@@ -537,13 +571,16 @@ impl Watch {
         Watch(walk.ok())
     }
 
-    /// The directories the walk descended into.
-    fn dirs(self) -> Option<Vec<PathBuf>> {
-        self.0?.join().ok()?
+    /// The directories the walk descended into, and the rule files beside them, stamped on the way.
+    fn stamps(self) -> Option<(Vec<FileStamp>, Vec<FileStamp>)> {
+        let Stamped { dirs, rules } = self.0?.join().ok()??;
+
+        Some((dirs, rules))
     }
 }
 
-/// Every directory that could gain or lose a file, as it is now.
+/// Every directory that could gain or lose a file, and the rule files beside them, as they were
+/// while the status of the repository was being computed.
 ///
 /// A new file changes the mtime of the directory holding it, so watching every directory a status
 /// scan descends into is enough to notice files appearing and disappearing anywhere - including in
@@ -554,7 +591,7 @@ impl Watch {
 /// The inode is watched along with the mtime, so that a directory which was replaced - by a
 /// symbolic link, another directory, or a file - is noticed even when the mtime it reports through
 /// the replacement happens to be the one that was recorded.
-fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Vec<PathBuf>> {
+fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Stamped> {
     let repo = shared.to_thread_local();
     let workdir = repo.workdir()?.to_owned();
     let index = repo.index_or_empty().ok()?;
@@ -582,7 +619,27 @@ fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Vec<PathBuf>> {
         .collect();
     dirs.sort();
 
-    Some(dirs)
+    let dir_stamps = stamp_all(&dirs);
+    // Two metadata calls per directory, in parallel: listing one instead would cost a lookup per
+    // entry it holds, which is more than the calls it saves. Only the ones that are there are kept -
+    // a rule file that appears changes the mtime of the directory holding it, which is watched, so
+    // watching the ones that exist is enough, and a stamp of a file that isn't there would be
+    // looked at again on every check.
+    let rule_stamps = dirs
+        .par_iter()
+        .with_min_len(PARALLEL_THRESHOLD)
+        .flat_map_iter(|dir| {
+            [dir.join(".gitignore"), dir.join(".gitattributes")]
+                .into_iter()
+                .map(FileStamp::read)
+                .filter(|stamp| stamp.state.is_some())
+        })
+        .collect();
+
+    Some(Stamped {
+        dirs: dir_stamps,
+        rules: rule_stamps,
+    })
 }
 
 /// The metadata of every path, as it is now.
@@ -631,35 +688,19 @@ impl gix::dir::walk::Delegate for WatchDirs {
 }
 
 /// The files that decide which files a status scan reports and how, and that can change without
-/// any directory changing: the ignore and attributes rules of the worktree, of the repository, of
-/// the user and of the system, and the configuration that selects them.
+/// any directory changing: the ignore and attributes rules of the repository, of the user and of the
+/// system, and the configuration that selects them. The rules of the worktree are stamped by the
+/// [walk](Watch) that finds them.
 ///
-/// A rule file that appears or disappears changes the mtime of the directory holding it, which is
-/// watched, but editing one that exists doesn't, so the metadata of the file itself is watched
-/// too. The configuration is watched because it says which global rule file applies, because it
-/// can turn untracked reporting off, and because of what it includes, see [`config_files()`].
+/// The configuration is watched because it says which global rule file applies, because it can turn
+/// untracked reporting off, and because of what it includes, see [`config_files()`].
 fn rule_stamps(
     git_dir: &Path,
     common_dir: &Path,
-    dirs: &[PathBuf],
     global_excludes: Option<&Path>,
     global_attributes: Option<&Path>,
 ) -> Option<Vec<FileStamp>> {
-    // Two metadata calls per watched directory: listing one instead would cost a lookup per entry
-    // it holds, which is more than the calls it saves. Only the ones that are there are kept - a
-    // rule file that appears changes the mtime of the directory holding it, which is watched, so
-    // watching the ones that exist is enough, and a stamp of a file that isn't there would be
-    // looked at again on every check.
-    let mut rules: Vec<FileStamp> = dirs
-        .par_iter()
-        .with_min_len(PARALLEL_THRESHOLD)
-        .flat_map_iter(|dir| {
-            [dir.join(".gitignore"), dir.join(".gitattributes")]
-                .into_iter()
-                .map(FileStamp::read)
-                .filter(|stamp| stamp.state.is_some())
-        })
-        .collect();
+    let mut rules = Vec::new();
 
     for path in [
         common_dir.join("info/exclude"),
@@ -921,9 +962,10 @@ pub(crate) mod tests {
         fn capture(&self) -> Guard {
             let repo = self.open();
             let watch = Watch::start(&repo.repo);
+            let recorded = Guard::record(&repo).expect("the repository can be watched");
             let report = status::report(&repo);
 
-            Guard::capture(&repo, &report, watch).expect("the repository can be watched")
+            Guard::capture(&repo, &report, recorded, watch).expect("the repository can be watched")
         }
     }
 
@@ -1172,11 +1214,10 @@ pub(crate) mod tests {
         content.push_str("[include]\n\tpath = ~no-such-user/rules.cfg\n");
         std::fs::write(&config, content).expect("the configuration can be written");
 
-        let repo_opened = repo.open();
-        let watch = Watch::start(&repo_opened.repo);
-        let report = status::report(&repo_opened);
-
-        assert!(Guard::capture(&repo_opened, &report, watch).is_none());
+        assert!(
+            Guard::record(&repo.open()).is_none(),
+            "a configuration that can't be resolved must leave the repository unwatched"
+        );
     }
 
     #[test]
@@ -1240,10 +1281,11 @@ pub(crate) mod tests {
         std::fs::create_dir(repo.path.join("empty")).expect("the directory can be created");
         std::fs::create_dir(repo.path.join("ignored")).expect("the directory can be created");
 
-        let dirs = watch_dirs(&repo.open().repo).expect("the worktree can be walked");
+        let Stamped { dirs, .. } =
+            watch_dirs(&repo.open().repo).expect("the worktree can be walked");
 
-        assert!(dirs.contains(&repo.path.join("empty")));
-        assert!(!dirs.iter().any(|dir| dir.ends_with("ignored")));
+        assert!(dirs.iter().any(|dir| dir.path == repo.path.join("empty")));
+        assert!(!dirs.iter().any(|dir| dir.path.ends_with("ignored")));
     }
 
     #[test]

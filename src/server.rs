@@ -383,21 +383,25 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Option<(PathBuf, En
     };
 
     // The worktree walk the guard needs runs while the status is computed, so that a repository
-    // that has to be scanned anyway doesn't wait for it afterwards.
+    // that has to be scanned anyway doesn't wait for it afterwards. What the guard records of the
+    // repository itself is read before the status starts, so that a change made while it runs can't
+    // be recorded as one the status already reflects.
     let watch = cache::Watch::start(&repo.repo);
+    let recorded = cache::Guard::record(&repo);
     let report = status::report(&repo);
     let code: i32 = report.status.into();
 
     // Only a status that covers the repository as a whole can be watched: a sparse index is served
     // by `git status` for the current directory, and an error leaves nothing worth reusing.
-    let guard = match root {
-        Some(root)
+    let guard = match (root, recorded) {
+        (Some(root), Some(recorded))
             if matches!(
                 report.status,
                 Status::Unchange | Status::Change | Status::Untracked
             ) && !status::is_sparse(&repo) =>
         {
-            cache::Guard::capture(&repo, &report, watch).map(|guard| (root.to_path_buf(), guard))
+            cache::Guard::capture(&repo, &report, recorded, watch)
+                .map(|guard| (root.to_path_buf(), guard))
         }
         _ => None,
     };
