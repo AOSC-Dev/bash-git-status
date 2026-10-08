@@ -720,6 +720,12 @@ fn config_roots(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
         common_dir.join("config"),
         git_dir.join("config.worktree"),
     ];
+
+    // The configuration of the git installation, which isn't always the system one: a git that was
+    // built into a prefix of its own - Homebrew's, one from a store - reads an `etc/gitconfig` of
+    // its own in addition to it, and where that is, only that git knows.
+    paths.extend(gix::path::env::installation_config().map(Path::to_owned));
+
     if let Some(config_home) = &config_home {
         paths.push(config_home.join("git/config"));
     }
@@ -925,6 +931,23 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn the_configuration_of_the_git_installation_is_watched() {
+        let repo = TempRepo::new("installation-config");
+        let git_dir = repo.path.join(".git");
+        let Some(installation) = gix::path::env::installation_config() else {
+            // A git that doesn't report one - because it is the system's own, or because it can't be
+            // run at all - leaves nothing to watch.
+            return;
+        };
+
+        assert!(
+            config_roots(&git_dir, &git_dir).contains(&installation.to_owned()),
+            "{} is read as configuration but not watched",
+            installation.display()
+        );
     }
 
     #[test]
