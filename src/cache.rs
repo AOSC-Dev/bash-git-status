@@ -562,8 +562,8 @@ impl gix::dir::walk::Delegate for WatchDirs {
 ///
 /// A rule file that appears or disappears changes the mtime of the directory holding it, which is
 /// watched, but editing one that exists doesn't, so the metadata of the file itself is watched
-/// too. The configuration is watched because it says which global rule file applies, and because
-/// it can turn untracked reporting off.
+/// too. The configuration is watched because it says which global rule file applies, because it
+/// can turn untracked reporting off, and because of what it includes, see [`config_files()`].
 fn rule_stamps(
     git_dir: &Path,
     common_dir: &Path,
@@ -589,8 +589,6 @@ fn rule_stamps(
     for path in [
         common_dir.join("info/exclude"),
         common_dir.join("info/attributes"),
-        common_dir.join("config"),
-        git_dir.join("config.worktree"),
     ] {
         rules.push(FileStamp::read(path));
     }
@@ -601,12 +599,34 @@ fn rule_stamps(
     }
 
     rules.extend(global_rule_files().into_iter().map(FileStamp::read));
+
+    // The configuration, and the files it includes: what an `include.path` points at is read as if
+    // it were written in the file that includes it, so a change there changes the status without
+    // any watched file changing.
+    rules.extend(
+        config_files(config_roots(git_dir, common_dir))
+            .into_iter()
+            .map(FileStamp::read),
+    );
+
     rules
 }
 
-/// The rule and configuration files of the user and of the system, at the places git looks for
-/// them.
+/// The rule files of the user, at the place git looks for them when `core.excludesFile` is not
+/// set: `$XDG_CONFIG_HOME/git/ignore`, which is `$HOME/.config/git/ignore` by default.
 fn global_rule_files() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+
+    config_home
+        .map(|config_home| vec![config_home.join("git/ignore")])
+        .unwrap_or_default()
+}
+
+/// The configuration files git reads for a repository, in the places it looks for them.
+fn config_roots(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -615,10 +635,10 @@ fn global_rule_files() -> Vec<PathBuf> {
     let mut paths = vec![
         std::env::var_os("GIT_CONFIG_SYSTEM")
             .map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
     ];
     if let Some(config_home) = &config_home {
-        // The default location of the global rule file, and the configuration next to it.
-        paths.push(config_home.join("git/ignore"));
         paths.push(config_home.join("git/config"));
     }
     if let Some(home) = &home {
@@ -629,6 +649,74 @@ fn global_rule_files() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+/// Every configuration file that is read, with the ones that are included from them.
+///
+/// `roots` are the files a [repository's configuration](config_roots()) is read from. The files
+/// they include are read as if their content were part of them, so they are watched as well.
+///
+/// Includes can be conditional (`includeIf`), and the condition is not evaluated: watching a file
+/// that turns out not to be read only means a change in it recomputes the status, which costs
+/// little compared to missing a change in one that is read.
+fn config_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    /// How deep git follows includes.
+    const MAX_DEPTH: usize = 10;
+
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending: Vec<(PathBuf, usize)> = roots.into_iter().map(|path| (path, 0)).collect();
+
+    while let Some((path, depth)) = pending.pop() {
+        if depth > MAX_DEPTH || !seen.insert(path.clone()) {
+            continue;
+        }
+
+        pending.extend(
+            include_paths(&path)
+                .into_iter()
+                .map(|included| (included, depth + 1)),
+        );
+        files.push(path);
+    }
+
+    files
+}
+
+/// The files `path` includes, as the `path` of its `include` sections name them.
+fn include_paths(path: &Path) -> Vec<PathBuf> {
+    let Ok(config) =
+        gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
+    else {
+        return Vec::new();
+    };
+
+    config
+        .sections()
+        .filter(|section| {
+            let name = section.header().name();
+
+            name.eq_ignore_ascii_case(b"include")
+                || name
+                    .get(..b"includeIf".len())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"includeIf"))
+        })
+        .flat_map(|section| section.body().values("path"))
+        .filter_map(|value| included_config(value, path.parent()))
+        .collect()
+}
+
+/// Resolve what an `include.path` says to the file it points at.
+///
+/// Relative paths are relative to the file that includes them, and a leading `~/` is the home
+/// directory, as in the configuration itself.
+fn included_config(value: impl AsRef<[u8]>, dir: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(OsStr::from_bytes(value.as_ref()));
+
+    match path.strip_prefix("~").ok() {
+        Some(rest) => Some(std::env::var_os("HOME").map(PathBuf::from)?.join(rest)),
+        None => Some(dir?.join(path)),
+    }
 }
 
 /// How long a guard may be used without re-verifying the assumption that directory mtimes change
@@ -707,6 +795,40 @@ mod tests {
         let guard = repo.capture();
 
         std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_changed_included_configuration_is_noticed() {
+        let repo = TempRepo::new("included-config");
+        let included = repo.path.join("included.cfg");
+        std::fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n")
+            .expect("the included file can be written");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!("[include]\n\tpath = {}\n", included.display()));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&included, "[status]\n\tshowUntrackedFiles = all\n")
+            .expect("the included file can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn an_included_configuration_that_appears_is_noticed() {
+        let repo = TempRepo::new("appearing-config");
+        let included = repo.path.join("included.cfg");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!("[include]\n\tpath = {}\n", included.display()));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n")
+            .expect("the included file can be written");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
