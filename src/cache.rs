@@ -134,7 +134,7 @@ impl Guard {
                 &dirs,
                 excluding.as_deref(),
                 attributing.as_deref(),
-            ),
+            )?,
             dirs: stamp_all(&dirs),
             created: Instant::now(),
         })
@@ -644,7 +644,7 @@ fn rule_stamps(
     dirs: &[PathBuf],
     global_excludes: Option<&Path>,
     global_attributes: Option<&Path>,
-) -> Vec<FileStamp> {
+) -> Option<Vec<FileStamp>> {
     // Two metadata calls per watched directory: listing one instead would cost a lookup per entry
     // it holds, which is more than the calls it saves. Only the ones that are there are kept - a
     // rule file that appears changes the mtime of the directory holding it, which is watched, so
@@ -679,12 +679,12 @@ fn rule_stamps(
     // it were written in the file that includes it, so a change there changes the status without
     // any watched file changing.
     rules.extend(
-        config_files(config_roots(git_dir, common_dir))
+        config_files(config_roots(git_dir, common_dir))?
             .into_iter()
             .map(FileStamp::read),
     );
 
-    rules
+    Some(rules)
 }
 
 /// The rule files at the places git reads them without being told to: the attributes file of the
@@ -741,7 +741,7 @@ fn config_roots(git_dir: &Path, common_dir: &Path) -> Vec<PathBuf> {
 /// Includes can be conditional (`includeIf`), and the condition is not evaluated: watching a file
 /// that turns out not to be read only means a change in it recomputes the status, which costs
 /// little compared to missing a change in one that is read.
-fn config_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+fn config_files(roots: impl IntoIterator<Item = PathBuf>) -> Option<Vec<PathBuf>> {
     /// How deep git follows includes.
     const MAX_DEPTH: usize = 10;
 
@@ -755,22 +755,25 @@ fn config_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
         }
 
         pending.extend(
-            include_paths(&path)
+            include_paths(&path)?
                 .into_iter()
                 .map(|included| (included, depth + 1)),
         );
         files.push(path);
     }
 
-    files
+    Some(files)
 }
 
 /// The files `path` includes, as the `path` of its `include` sections name them.
-fn include_paths(path: &Path) -> Vec<PathBuf> {
+///
+/// `None` when one of them can't be resolved the way the configuration resolves it, see
+/// [`included_config()`].
+fn include_paths(path: &Path) -> Option<Vec<PathBuf>> {
     let Ok(config) =
         gix::config::File::from_path_no_includes(path.to_owned(), gix::config::Source::Local)
     else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
     config
@@ -784,20 +787,33 @@ fn include_paths(path: &Path) -> Vec<PathBuf> {
                     .is_some_and(|name| name.eq_ignore_ascii_case(b"includeIf"))
         })
         .flat_map(|section| section.body().values("path"))
-        .filter_map(|value| included_config(value, path.parent()))
+        .map(|value| included_config(value, path.parent()))
         .collect()
 }
 
-/// Resolve what an `include.path` says to the file it points at.
+/// Resolve what an `include.path` says to the file it points at, the way the configuration resolves
+/// it: `~/` is the home directory of the user, `~user` the home of that user, and `%(prefix)` the
+/// directory the binary is in. What is left relative is relative to the file that says it.
 ///
-/// Relative paths are relative to the file that includes them, and a leading `~/` is the home
-/// directory, as in the configuration itself.
+/// `None` when the path can't be resolved - a user that doesn't exist, for instance - because what
+/// the include would read is not known then.
 fn included_config(value: impl AsRef<[u8]>, dir: Option<&Path>) -> Option<PathBuf> {
-    let path = Path::new(OsStr::from_bytes(value.as_ref()));
+    let home = gix::path::env::home_dir();
+    let installation = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_owned));
 
-    match path.strip_prefix("~").ok() {
-        Some(rest) => Some(std::env::var_os("HOME").map(PathBuf::from)?.join(rest)),
-        None => Some(dir?.join(path)),
+    let path = gix::config::Path::from(gix::bstr::BStr::new(value.as_ref()))
+        .interpolate(gix::config::path::interpolate::Context {
+            git_install_dir: installation.as_deref(),
+            home_dir: home.as_deref(),
+            home_for_user: Some(gix::config::path::interpolate::home_for_user),
+        })
+        .ok()?;
+
+    match path.is_absolute() {
+        true => Some(path),
+        false => Some(dir?.join(path)),
     }
 }
 
@@ -813,6 +829,7 @@ fn trust_window() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gix::config::path::interpolate::home_for_user;
 
     /// A repository of its own, in a directory that is removed when the test ends.
     struct TempRepo {
@@ -821,7 +838,11 @@ mod tests {
 
     impl TempRepo {
         fn new(name: &str) -> TempRepo {
-            let path = std::env::temp_dir().join(format!(
+            TempRepo::new_in(&std::env::temp_dir(), name)
+        }
+
+        fn new_in(parent: &Path, name: &str) -> TempRepo {
+            let path = parent.join(format!(
                 "bash-git-status-test-{}-{name}",
                 std::process::id()
             ));
@@ -1068,6 +1089,71 @@ mod tests {
             .expect("the included file can be edited");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn an_included_path_naming_a_user_is_resolved_through_that_user() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
+
+        assert_eq!(
+            included_config("~/rules.cfg", None),
+            Some(home.join("rules.cfg"))
+        );
+        assert_eq!(
+            included_config("~root/rules.cfg", None),
+            home_for_user("root").map(|home| home.join("rules.cfg"))
+        );
+        assert_eq!(included_config("~no-such-user/rules.cfg", None), None);
+        assert_eq!(
+            included_config("rules.cfg", Some(Path::new("/etc"))),
+            Some(PathBuf::from("/etc/rules.cfg"))
+        );
+        assert_eq!(included_config("rules.cfg", None), None);
+    }
+
+    #[test]
+    fn a_changed_configuration_included_as_a_user_home_path_is_noticed() {
+        let Ok(user) = std::env::var("USER") else {
+            return;
+        };
+        let home = gix::path::env::home_dir().expect("a home directory");
+        if home_for_user(&user).as_deref() != Some(home.as_path()) {
+            return;
+        }
+
+        let repo = TempRepo::new_in(&home, "user-home-config");
+        let included = repo.path.join("included.cfg");
+        std::fs::write(&included, "[status]\n\tshowUntrackedFiles = no\n")
+            .expect("the included file can be written");
+        let named = format!(
+            "~{user}/{}",
+            included.strip_prefix(&home).unwrap().display()
+        );
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!("[include]\n\tpath = {named}\n"));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&included, "[status]\n\tshowUntrackedFiles = all\n")
+            .expect("the included file can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_configuration_that_can_not_be_resolved_is_not_watched() {
+        let repo = TempRepo::new("unresolvable-config");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str("[include]\n\tpath = ~no-such-user/rules.cfg\n");
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let repo_opened = repo.open();
+        let watch = Watch::start(&repo_opened.repo);
+        let report = status::report(&repo_opened);
+
+        assert!(Guard::capture(&repo_opened, &report, watch).is_none());
     }
 
     #[test]

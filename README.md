@@ -36,7 +36,10 @@ configuration itself - the repository's, the user's and the system's, with the f
 includes them, and each of them with what a symbolic link of it points at. Watching a rule file or a
 configuration file that doesn't exist isn't needed, because creating one changes the mtime of the
 directory that holds it; a file that an `include.path` points at is watched whether or not it is
-conditional or there.
+conditional or there. An `include.path` is resolved the way the configuration resolves it, `~user/`
+being that user's home directory and `%(prefix)/` the directory of the running binary; a path that
+can't be resolved that way leaves the repository unwatched, since what the include would read isn't
+known.
 
 An entry is still only served for `BASH_GIT_STATUS_TRUST_SECS` (default 60) before the status is
 computed from scratch again, which bounds the effect of filesystems that don't update directory
