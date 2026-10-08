@@ -141,6 +141,31 @@ impl Guard {
             return Verdict::Unknown;
         }
 
+        // The configuration and the files it decides with come before the worktree is looked at:
+        // whether a file counts as modified, and which files are reported at all, is decided with
+        // the configuration the status was computed with, so a change in it - `core.filemode`, or
+        // which files are ignored - makes the answer unknown even when the worktree still holds
+        // what was recorded. Both `worktree_changed()` and the comparison it falls back to would
+        // otherwise answer with the configuration of the repository this guard holds, which is the
+        // one that was read when the status was computed.
+        let (dirs, rules) = rayon::join(
+            || {
+                self.dirs
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::dir_matches)
+            },
+            || {
+                self.rules
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::matches)
+            },
+        );
+        if !(dirs && rules) {
+            return Verdict::Unknown;
+        }
+
         // Staged changes are the difference between the tree `HEAD` points at and the index, both
         // of which are unchanged.
         if self.staged {
@@ -158,24 +183,6 @@ impl Guard {
             Ok(false) if self.code == Status::Change.into() => return Verdict::Unknown,
             Ok(false) => {}
             Err(_) => return Verdict::Unknown,
-        }
-
-        let (dirs, rules) = rayon::join(
-            || {
-                self.dirs
-                    .par_iter()
-                    .with_min_len(PARALLEL_THRESHOLD)
-                    .all(FileStamp::dir_matches)
-            },
-            || {
-                self.rules
-                    .par_iter()
-                    .with_min_len(PARALLEL_THRESHOLD)
-                    .all(FileStamp::matches)
-            },
-        );
-        if !(dirs && rules) {
-            return Verdict::Unknown;
         }
 
         Verdict::Unchanged
@@ -772,6 +779,42 @@ mod tests {
                 .expect("a commit can be created");
         }
 
+        /// Track `name`, which holds `content`, in both `HEAD` and the index, so that a change to
+        /// it is a change to the worktree and nothing is staged.
+        fn track(&self, name: &str, content: &str) {
+            let repo = self.open().repo.to_thread_local();
+            let blob = repo
+                .write_blob(content)
+                .expect("a blob can be written")
+                .detach();
+            let mut tree = gix::objs::Tree::empty();
+            tree.entries.push(gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: name.into(),
+                oid: blob,
+            });
+            let tree = repo
+                .write_object(&tree)
+                .expect("a tree can be written")
+                .detach();
+            let who = gix::actor::SignatureRef {
+                name: "test".into(),
+                email: "test@example.com".into(),
+                time: "0 +0000",
+            };
+            let parent = repo.head_commit().expect("the repository has a commit").id;
+
+            repo.commit_as(who, who, "HEAD", "track a file", tree, Some(parent))
+                .expect("a commit can be created");
+
+            let mut index = repo
+                .index_from_tree(&tree)
+                .expect("an index can be built from the tree");
+            index
+                .write(gix::index::write::Options::default())
+                .expect("the index can be written");
+        }
+
         /// Capture a guard of the repository as it is now, as the daemon would.
         fn capture(&self) -> Guard {
             let repo = self.open();
@@ -795,6 +838,37 @@ mod tests {
         let guard = repo.capture();
 
         std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_changed_configuration_is_noticed_while_the_worktree_differs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new("configured-worktree");
+        let file = repo.path.join("file.txt");
+        std::fs::write(&file, "one\n").expect("the file can be written");
+        repo.track("file.txt", "one\n");
+
+        // An executable bit is a difference between the worktree and the index, unless the
+        // configuration says that it isn't one.
+        let mut permissions = std::fs::metadata(&file)
+            .expect("the file exists")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&file, permissions).expect("the file can be made executable");
+        let guard = repo.capture();
+        assert_eq!(
+            guard.code,
+            Status::Change.into(),
+            "the worktree differs from the index"
+        );
+
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str("[core]\n\tfilemode = false\n");
+        std::fs::write(&config, content).expect("the configuration can be written");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
