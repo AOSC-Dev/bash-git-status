@@ -99,13 +99,24 @@ impl Guard {
         let shared = &repo.repo;
         let tl = shared.to_thread_local();
         let git_dir = tl.git_dir().to_owned();
-        tl.workdir()?;
+        let workdir = tl.workdir()?.to_owned();
 
         let mut fingerprint = vec![
             FileStamp::read(tl.index_path()),
             FileStamp::read(git_dir.join("HEAD")),
         ];
         fingerprint.extend(head_stamps(&git_dir, tl.common_dir())?);
+
+        // The files that say where the repository is: a checkout of `git worktree` and a repository
+        // made with `--separate-git-dir` have a `.git` file instead of a directory, and a linked
+        // worktree a `commondir` file. Both are rewritten in place when the repository they point at
+        // is changed, while everything below them - the index, the references - is watched as the
+        // files of the repository this guard was captured for.
+        let dot_git = workdir.join(".git");
+        if !dot_git.is_dir() {
+            fingerprint.push(FileStamp::read(dot_git));
+        }
+        fingerprint.push(FileStamp::read(git_dir.join("commondir")));
 
         let dirs = watch.dirs()?;
         let config = tl.config_snapshot();
@@ -882,6 +893,26 @@ mod tests {
 
         let guard = repo.capture();
         std::fs::write(&target, "*.txt\ttext\n").expect("the rule can be edited");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_git_file_that_points_elsewhere_is_noticed() {
+        let repo = TempRepo::new("gitfile");
+        let git_dir = repo.path.join("git-dir");
+        std::fs::rename(repo.path.join(".git"), &git_dir).expect("the git directory can be moved");
+        let git_file = repo.path.join(".git");
+        std::fs::write(&git_file, format!("gitdir: {}\n", git_dir.display()))
+            .expect("the git directory can be pointed at");
+
+        let guard = repo.capture();
+        let other = TempRepo::new("gitfile-other");
+        std::fs::write(
+            &git_file,
+            format!("gitdir: {}\n", other.path.join(".git").display()),
+        )
+        .expect("the git file can be rewritten");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
