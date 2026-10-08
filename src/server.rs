@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -158,28 +159,70 @@ pub fn run() -> ! {
 
 /// A fingerprint of the environment that decides which configuration files are read.
 ///
-/// The daemon keeps the `HOME` and `XDG_CONFIG_HOME` of the shell that started it and reads the
-/// configuration they point at, so a client whose own point somewhere else can't take its answer:
-/// both sides hash what they have and only agree if it is the same. Hashed, because all the client
-/// needs to know is whether the answers would be made with the same configuration.
+/// The daemon keeps the environment of the shell that started it, so a client whose own differs in
+/// a way that changes the status can't take its answer: both sides hash what they have and only
+/// agree if it is the same. Hashed, because all the client needs to know is whether the answers
+/// would be made with the same configuration.
+///
+/// `HOME` and `XDG_CONFIG_HOME` decide where the user's configuration is read from, and the `git`
+/// of `PATH` is the one whose installation configuration is read along with it - and the one that
+/// serves a repository with a sparse index.
 fn config_identity() -> u64 {
+    let home = std::env::var_os("HOME");
+    let config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let git = git_executable();
+
+    config_identity_of(home.as_deref(), config_home.as_deref(), git.as_deref())
+}
+
+/// [`config_identity()`] of the values it is made of.
+fn config_identity_of(
+    home: Option<&OsStr>,
+    config_home: Option<&OsStr>,
+    git: Option<&Path>,
+) -> u64 {
     /// FNV-1a, which only has to tell environments apart, not resist an attack.
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    let values = [home, config_home, git.map(Path::as_os_str)];
+
     let mut hash = OFFSET;
-    for name in ["HOME", "XDG_CONFIG_HOME"] {
-        if let Some(value) = std::env::var_os(name) {
+    for value in values {
+        if let Some(value) = value {
             for byte in value.as_encoded_bytes() {
                 hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
             }
         }
 
-        // A separator, so that two variables can't be mistaken for one value.
+        // A separator, so that two values can't be mistaken for one.
         hash = hash.wrapping_mul(PRIME) ^ u64::from(u8::MAX);
     }
 
     hash
+}
+
+/// The `git` a shell with this `PATH` would run.
+fn git_executable() -> Option<PathBuf> {
+    executable_in_path(&std::env::var_os("PATH")?, "git")
+}
+
+/// The first `name` of `path` that can be run, as the file it is.
+///
+/// A link is resolved to the file it points at, so that two spellings of one program are told apart
+/// from two programs. An entry that isn't absolute is resolved against the working directory, which
+/// a daemon has another one of than a client, so rather than let two of them agree on a name that
+/// means different programs to each, they disagree.
+fn executable_in_path(path: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|dir| {
+        let candidate = dir.join(name);
+        let metadata = std::fs::metadata(&candidate).ok()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+
+        Some(std::fs::canonicalize(&candidate).unwrap_or(candidate))
+    })
 }
 
 /// The name of an environment override that is set, if there is one.
@@ -584,6 +627,7 @@ pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::cache::tests::TempRepo;
+    use std::fs::Permissions;
 
     /// A request as a client sends it, for `path`.
     fn request(path: &[u8]) -> Vec<u8> {
@@ -670,6 +714,50 @@ mod tests {
         assert_eq!(read_reply(b""), None);
         assert_eq!(read_reply(b"BGS4 5"), None);
         assert_eq!(read_reply(b"BGS4 x\nmain"), None);
+    }
+
+    #[test]
+    fn a_shell_whose_git_is_another_one_is_answered_by_neither() {
+        let identity = |home: Option<&OsStr>, git: Option<&OsStr>| {
+            config_identity_of(home, None, git.map(Path::new))
+        };
+        let (here, elsewhere) = (OsStr::new("/usr/bin/git"), OsStr::new("/opt/git/bin/git"));
+
+        assert_eq!(identity(None, Some(here)), identity(None, Some(here)));
+        assert_ne!(identity(None, Some(here)), identity(None, Some(elsewhere)));
+        assert_ne!(identity(None, Some(here)), identity(None, None));
+        assert_ne!(
+            identity(Some(OsStr::new("/home/a")), None),
+            identity(None, None)
+        );
+    }
+
+    #[test]
+    fn the_git_of_a_path_is_the_first_one_that_can_be_run() {
+        let dir = std::env::temp_dir().join(format!("bash-git-status-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (runnable, not_runnable) = (dir.join("first"), dir.join("second"));
+        for directory in [&runnable, &not_runnable] {
+            std::fs::create_dir_all(directory).expect("the test directory can be created");
+            std::fs::write(directory.join("git"), "").expect("the file can be written");
+        }
+        std::fs::set_permissions(runnable.join("git"), Permissions::from_mode(0o755))
+            .expect("the file can be made runnable");
+        std::fs::set_permissions(not_runnable.join("git"), Permissions::from_mode(0o644))
+            .expect("the file can be left un-runnable");
+
+        let path = std::env::join_paths([&runnable, &not_runnable]).expect("a path can be built");
+        let found = executable_in_path(&path, "git");
+        assert_eq!(
+            found,
+            Some(std::fs::canonicalize(runnable.join("git")).expect("the file resolves"))
+        );
+
+        // A name that no entry holds is nothing, and neither is a path of nothing but a name that
+        // can't be run.
+        assert_eq!(executable_in_path(&path, "hg"), None);
+        assert_eq!(executable_in_path(not_runnable.as_os_str(), "git"), None);
+        std::fs::remove_dir_all(&dir).expect("the directory can be removed");
     }
 
     #[test]
