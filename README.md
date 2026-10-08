@@ -10,9 +10,10 @@ By default the status is served by a small per-user daemon (a unix socket in `$X
 `/tmp` when it isn't set). It starts on demand - the first `bash-git-status` call spawns it and
 waits for it to bind - and every shell asks the same one, so a repository another shell already
 looked at is answered from its cache. The daemon caches one result per repository, shared by all of
-its directories, and reuses it until the repository changes: the index (`git add`, `git commit`,
-`git reset`), `HEAD` (checkouts, commits, in-progress operations), tracked files that were modified,
-added, removed or made executable, and untracked files that appeared or vanished. A directory inside
+its directories, and answers from it only while it can tell that the repository is still the one the
+result was computed for: the index (`git add`, `git commit`, `git reset`), `HEAD` (checkouts,
+commits, in-progress operations), tracked files that were modified, added, removed or made
+executable, and untracked files that appeared or vanished. A directory inside
 a huge repository therefore answers in a few milliseconds instead of scanning the worktree again.
 
 Detecting a change this way means no scan when nothing changed: the mtime and inode of every
@@ -46,9 +47,11 @@ computed from scratch again, which bounds the effect of filesystems that don't u
 mtimes. Once that window has passed, the prompt asking for the status waits for that recomputation,
 so a repository is scanned again at most once every 60 seconds of use; raise the setting if the
 filesystems holding the worktree and `.git` report directory mtimes reliably, or lower it if they
-don't. Repositories that can't be watched this way (a sparse index, a reference backend without
-reference files, or more directories than the daemon is willing to watch) and directories outside
-any repository are kept for `BASH_GIT_STATUS_TTL_MS` (default 500).
+don't. Nothing else is reused: a repository that can't be watched this way (a sparse index, a
+reference backend without reference files, a configuration path that can't be resolved, or more
+directories than the daemon is willing to watch) and a directory that isn't inside a repository are
+computed again for every request, so a prompt never shows a status that has passed - a directory
+that has just become a repository is answered as one.
 
 - The daemon starts on demand and exits after `BASH_GIT_STATUS_IDLE_SECS` (default 600) of
   inactivity; kill it early with `pkill -x bash-git-status`.
@@ -68,7 +71,5 @@ any repository are kept for `BASH_GIT_STATUS_TTL_MS` (default 500).
 - `BASH_GIT_STATUS_NO_SERVER=1` disables the daemon entirely.
 - `BASH_GIT_STATUS_TRUST_SECS` bounds how long a status may be served before the status is computed
   again.
-- `BASH_GIT_STATUS_TTL_MS` is the freshness window for repositories and directories that can't be
-  watched for changes.
 - `BASH_GIT_STATUS_SERVER_LOG=<file>` appends the daemon's log output to a file, which with
   `RUST_LOG=debug` shows its startup and the failures it doesn't report to the prompt.

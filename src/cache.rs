@@ -94,7 +94,7 @@ impl Guard {
     /// Record the state of the repository that `report` was computed for.
     ///
     /// Returns `None` if the repository can't be watched for changes reliably, in which case the
-    /// caller has to fall back to keeping its result for a fixed amount of time.
+    /// caller has to compute its status again for every request.
     pub fn capture(repo: &status::Repo, report: &status::Report, watch: Watch) -> Option<Guard> {
         let shared = &repo.repo;
         let tl = shared.to_thread_local();
@@ -827,17 +827,17 @@ fn trust_window() -> Duration {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use gix::config::path::interpolate::home_for_user;
 
     /// A repository of its own, in a directory that is removed when the test ends.
-    struct TempRepo {
-        path: PathBuf,
+    pub(crate) struct TempRepo {
+        pub(crate) path: PathBuf,
     }
 
     impl TempRepo {
-        fn new(name: &str) -> TempRepo {
+        pub(crate) fn new(name: &str) -> TempRepo {
             TempRepo::new_in(&std::env::temp_dir(), name)
         }
 

@@ -2,12 +2,13 @@
 //!
 //! Clients ask it over a unix socket for the prompt text and exit code of
 //! their current directory. Every directory of a repository shares one entry,
-//! and the entry is reused for as long as the repository is unchanged: staged
-//! changes, the branch and a modified, added or removed file all invalidate it
-//! (see `crate::cache`). Only when a repository can't be watched, or when its
-//! entry is older than `BASH_GIT_STATUS_TRUST_SECS`, the answer is recomputed
-//! unconditionally, and directories outside a repository are kept for
-//! `BASH_GIT_STATUS_TTL_MS` (default 500ms).
+//! and the entry is answered from only while its guard proves that the
+//! repository is still the one the status was computed for: staged changes,
+//! the branch and a modified, added or removed file all invalidate it (see
+//! `crate::cache`). An entry that can't be proven - a repository that can't be
+//! watched, a directory outside any repository, or one older than
+//! `BASH_GIT_STATUS_TRUST_SECS` - is computed again before the reply, so a
+//! status that has passed is never served while a new one is pending.
 //!
 //! The daemon starts on demand, exits after `BASH_GIT_STATUS_IDLE_SECS`
 //! (default 600) without requests, and a lock file next to the socket keeps
@@ -38,7 +39,7 @@ use std::time::{Duration, Instant};
 
 /// Protocol marker, so a client can't be fooled by a reply from an outdated daemon after the
 /// binary was rebuilt, and so that a request can't be taken for a reply.
-const PREFIX: &[u8] = b"BGS3 ";
+const PREFIX: &[u8] = b"BGS4 ";
 
 /// The longest directory a request may ask about; a path that doesn't exist is longer than it can
 /// be, and the length is what a client states rather than what it sent.
@@ -78,31 +79,21 @@ const MAX_ENTRIES: usize = 32;
 
 type Cache = Arc<Mutex<HashMap<PathBuf, Entry>>>;
 
-enum Entry {
-    /// The status of a whole repository, shared by every directory inside it and reused as long as
-    /// its [`Guard`] doesn't see a change.
-    Repo {
-        code: i32,
-        guard: Arc<Guard>,
-        last_used: Instant,
-    },
+/// The status of a whole repository, shared by every directory inside it.
+///
+/// Nothing else is kept: an entry is only answered from while its guard proves that the repository
+/// is still the one the status was computed for, and a status that can't be guarded - one of a
+/// repository that can't be watched, or of a directory that isn't in a repository at all - would be
+/// answered from without anything having checked it.
+struct Entry {
+    /// The exit code of the status the guard was captured for.
+    code: i32,
 
-    /// The status of a single directory, kept for a fixed amount of time because it can't be
-    /// watched for changes.
-    Dir {
-        code: i32,
-        text: String,
-        computed_at: Instant,
-    },
-}
+    /// Proves that the repository is unchanged, and says what its status is when it did change.
+    guard: Arc<Guard>,
 
-impl Entry {
-    fn last_used(&self) -> Instant {
-        match self {
-            Entry::Repo { last_used, .. } => *last_used,
-            Entry::Dir { computed_at, .. } => *computed_at,
-        }
-    }
+    /// When the entry was answered from last, for eviction.
+    last_used: Instant,
 }
 
 /// Run the daemon; it either exits via [`std::process::exit`] or serves forever.
@@ -211,13 +202,12 @@ fn drop_environment_overrides() {
     }
 }
 
-/// Read a request, which is `BGS3 <ttl-ms> <identity> <len>` followed by that many bytes of a
-/// directory.
+/// Read a request, which is `BGS4 <identity> <len>` followed by that many bytes of a directory.
 ///
 /// The path is sent as its length instead of being terminated: a directory whose name contains a
 /// newline is then still the directory that was asked about, and not a prefix of it that happens to
 /// be another repository.
-fn read_request(reader: &mut impl BufRead) -> Result<Option<(u64, Duration, PathBuf)>> {
+fn read_request(reader: &mut impl BufRead) -> Result<Option<(u64, PathBuf)>> {
     let mut header = Vec::new();
     if reader.read_until(b'\n', &mut header)? == 0 {
         return Ok(None);
@@ -234,11 +224,7 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<(u64, Duration, Path
             .and_then(|field| u64::from_str_radix(field, radix).ok())
     };
 
-    let (Some(ttl), Some(identity), Some(len)) = (
-        number(fields.next(), 10),
-        number(fields.next(), 16),
-        number(fields.next(), 10),
-    ) else {
+    let (Some(identity), Some(len)) = (number(fields.next(), 16), number(fields.next(), 10)) else {
         return Ok(None);
     };
     let Ok(len) = usize::try_from(len) else {
@@ -251,16 +237,12 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<(u64, Duration, Path
     let mut path = vec![0u8; len];
     reader.read_exact(&mut path)?;
 
-    Ok(Some((
-        identity,
-        Duration::from_millis(ttl),
-        PathBuf::from(OsStr::from_bytes(&path)),
-    )))
+    Ok(Some((identity, PathBuf::from(OsStr::from_bytes(&path)))))
 }
 
 fn handle(mut stream: Stream, cache: &Cache, identity: u64) -> Result<()> {
     let mut reader = BufReader::new(&stream);
-    let Some((client, ttl, cwd)) = read_request(&mut reader)? else {
+    let Some((client, cwd)) = read_request(&mut reader)? else {
         return Ok(());
     };
 
@@ -274,17 +256,18 @@ fn handle(mut stream: Stream, cache: &Cache, identity: u64) -> Result<()> {
         return Ok(());
     }
 
-    // Every directory of a repository shares one entry, keyed by its root.
+    // Every directory of a repository shares one entry, keyed by its root. Whatever that entry
+    // can't answer is computed now: the status of a repository the daemon can't watch, and of a
+    // directory that isn't in one, is never taken from an earlier answer.
     let root = repo_root(&cwd);
-    let answer = root
-        .as_deref()
-        .and_then(|root| reuse_repo(root, cache))
-        .or_else(|| reuse_dir(&cwd, cache, ttl));
+    let answer = root.as_deref().and_then(|root| reuse_repo(root, cache));
     let (code, text) = match answer {
         Some(answer) => answer,
         None => {
             let (code, text, cached) = compute(&cwd, root.as_deref());
-            remember(cache, cached.key, cached.entry);
+            if let Some((key, entry)) = cached {
+                remember(cache, key, entry);
+            }
             (code, text)
         }
     };
@@ -318,19 +301,12 @@ fn repo_root(cwd: &Path) -> Option<PathBuf> {
 fn reuse_repo(root: &Path, cache: &Cache) -> Option<(i32, String)> {
     let (code, guard) = {
         let mut cache = cache.lock().unwrap();
-        let Some(Entry::Repo {
-            code,
-            guard,
-            last_used,
-        }) = cache.get_mut(root)
-        else {
-            return None;
-        };
-        if !guard.fresh() {
+        let entry = cache.get_mut(root)?;
+        if !entry.guard.fresh() {
             return None;
         }
-        *last_used = Instant::now();
-        (*code, Arc::clone(guard))
+        entry.last_used = Instant::now();
+        (entry.code, Arc::clone(&entry.guard))
     };
 
     // Checking runs the expensive part without holding the lock, and only then is the answer
@@ -348,34 +324,19 @@ fn reuse_repo(root: &Path, cache: &Cache) -> Option<(i32, String)> {
         .map(|text| (code, text))
 }
 
-/// Answer a request from the time-based entry for `cwd`, if there is a fresh one.
-fn reuse_dir(cwd: &Path, cache: &Cache, ttl: Duration) -> Option<(i32, String)> {
-    let cache = cache.lock().unwrap();
-    let Some(Entry::Dir {
-        code,
-        text,
-        computed_at,
-    }) = cache.get(cwd)
-    else {
-        return None;
-    };
-
-    (computed_at.elapsed() < ttl).then(|| (*code, text.clone()))
-}
-
-/// A status and the cache entry that would let a later request skip computing it.
-struct Cached {
-    key: PathBuf,
-    entry: Entry,
-}
-
-/// Compute the answer for `cwd`, like [`status::compute()`], and remember it if possible.
-fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
+/// Compute the answer for `cwd`, like [`status::compute()`], along with the entry that would let a
+/// later request skip computing it.
+///
+/// The entry is missing when the status can't be watched: for a directory that isn't in a
+/// repository, for one whose repository can't be opened, and for a repository whose changes nothing
+/// would notice. Its answer is then computed for every request - an entry that nothing proves would
+/// otherwise be served while it may already be wrong.
+fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Option<(PathBuf, Entry)>) {
     let Ok(repo) = status::get_repo(cwd) else {
-        return without_repo(cwd);
+        return without_repo();
     };
     let Ok(text) = status::repo_progress(&repo) else {
-        return without_repo(cwd);
+        return without_repo();
     };
 
     // The worktree walk the guard needs runs while the status is computed, so that a repository
@@ -398,41 +359,23 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Cached) {
         _ => None,
     };
 
-    let cached = match guard {
-        Some((key, guard)) => Cached {
+    let cached = guard.map(|(key, guard)| {
+        (
             key,
-            entry: Entry::Repo {
+            Entry {
                 code,
                 guard: Arc::new(guard),
                 last_used: Instant::now(),
             },
-        },
-        None => Cached {
-            key: cwd.to_path_buf(),
-            entry: Entry::Dir {
-                code,
-                text: text.clone(),
-                computed_at: Instant::now(),
-            },
-        },
-    };
+        )
+    });
 
     (code, text, cached)
 }
 
 /// The historical answer for a directory that isn't a repository, or can't be inspected.
-fn without_repo(cwd: &Path) -> (i32, String, Cached) {
-    let (code, text) = (1, String::new());
-    let cached = Cached {
-        key: cwd.to_path_buf(),
-        entry: Entry::Dir {
-            code,
-            text: text.clone(),
-            computed_at: Instant::now(),
-        },
-    };
-
-    (code, text, cached)
+fn without_repo() -> (i32, String, Option<(PathBuf, Entry)>) {
+    (1, String::new(), None)
 }
 
 /// Keep an entry in the cache, evicting the least recently used ones beyond [`MAX_ENTRIES`].
@@ -443,7 +386,7 @@ fn remember(cache: &Cache, key: PathBuf, entry: Entry) {
     while cache.len() > MAX_ENTRIES {
         let oldest = cache
             .iter()
-            .min_by_key(|(_, entry)| entry.last_used())
+            .min_by_key(|(_, entry)| entry.last_used)
             .map(|(key, _)| key.clone());
         match oldest {
             Some(oldest) => {
@@ -496,8 +439,6 @@ fn try_query(socket: &Path, cwd: &Path) -> Option<(i32, String)> {
     let path = cwd.as_os_str().as_bytes();
     let mut request = Vec::with_capacity(PREFIX.len() + 48 + path.len());
     request.extend_from_slice(PREFIX);
-    request.extend_from_slice(ttl().as_millis().to_string().as_bytes());
-    request.push(b' ');
     request.extend_from_slice(format!("{:016x}", config_identity()).as_bytes());
     request.push(b' ');
     request.extend_from_slice(path.len().to_string().as_bytes());
@@ -587,11 +528,6 @@ fn spawn_idle_monitor(socket: PathBuf, last_activity: Arc<Mutex<Instant>>) {
     });
 }
 
-/// The freshness window requested by the client for a cache hit.
-fn ttl() -> Duration {
-    Duration::from_millis(env_u64("BASH_GIT_STATUS_TTL_MS", 500))
-}
-
 fn idle_timeout() -> Duration {
     Duration::from_secs(env_u64("BASH_GIT_STATUS_IDLE_SECS", 600))
 }
@@ -606,12 +542,13 @@ pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::tests::TempRepo;
 
     /// A request as a client sends it, for `path`.
     fn request(path: &[u8]) -> Vec<u8> {
         let mut request = Vec::new();
         request.extend_from_slice(PREFIX);
-        request.extend_from_slice(b"500 0011223344556677 ");
+        request.extend_from_slice(b"0011223344556677 ");
         request.extend_from_slice(path.len().to_string().as_bytes());
         request.push(b'\n');
         request.extend_from_slice(path);
@@ -625,26 +562,70 @@ mod tests {
         let request = request(path.as_bytes());
         let mut reader = BufReader::new(&request[..]);
 
-        let (identity, ttl, read) = read_request(&mut reader)
+        let (identity, read) = read_request(&mut reader)
             .expect("a request can be read")
             .expect("the request is well formed");
 
         assert_eq!(identity, 0x0011_2233_4455_6677);
-        assert_eq!(ttl, Duration::from_millis(500));
         assert_eq!(read, PathBuf::from(path));
+    }
+
+    #[test]
+    fn a_repository_that_can_be_watched_is_remembered() {
+        let repo = TempRepo::new("remembered");
+
+        let (code, _, cached) = compute(&repo.path, Some(&repo.path));
+
+        assert_eq!(code, 5);
+        assert!(cached.is_some(), "a watchable repository is remembered");
+    }
+
+    #[test]
+    fn a_repository_that_can_not_be_watched_is_not_remembered() {
+        let repo = TempRepo::new("unwatched");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str("[include]\n\tpath = ~no-such-user-bash-git-status/x.cfg\n");
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let (code, _, cached) = compute(&repo.path, Some(&repo.path));
+
+        assert_eq!(code, 5);
+        assert!(
+            cached.is_none(),
+            "a repository whose changes nothing would notice must not be remembered"
+        );
+    }
+
+    #[test]
+    fn a_directory_outside_a_repository_is_not_remembered() {
+        let dir =
+            std::env::temp_dir().join(format!("bash-git-status-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the directory can be created");
+
+        let (code, text, cached) = compute(&dir, None);
+
+        assert_eq!((code, text.as_str()), (1, ""));
+        assert!(
+            cached.is_none(),
+            "a directory that may become a repository must not be remembered"
+        );
+        std::fs::remove_dir_all(&dir).expect("the directory can be removed");
     }
 
     #[test]
     fn a_malformed_request_is_ignored() {
         for request in [
-            // Too few fields, an old protocol, a path that is too long or too short, and a field
-            // that doesn't belong.
-            &b"BGS3 500 0011223344556677\n"[..],
-            &b"BGS2 500 0011223344556677 3\nabc"[..],
-            &b"BGS3 500 0011223344556677 99999\nabc"[..],
-            &b"BGS3 500 0011223344556677 3\nab"[..],
-            &b"BGS3 500 0011223344556677 3 x\nabc"[..],
-            &b"BGS3 x 0011223344556677 3\nabc"[..],
+            // Too few fields, an old protocol, a path that is too long or too short, an empty path,
+            // and a field that doesn't belong.
+            &b"BGS4 0011223344556677\n"[..],
+            &b"BGS3 500 0011223344556677 3\nabc"[..],
+            &b"BGS4 0011223344556677 99999\nabc"[..],
+            &b"BGS4 0011223344556677 3\nab"[..],
+            &b"BGS4 0011223344556677 0\n"[..],
+            &b"BGS4 0011223344556677 3 x\nabc"[..],
+            &b"BGS4 x 3\nabc"[..],
         ] {
             let mut reader = BufReader::new(request);
 
