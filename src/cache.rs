@@ -23,6 +23,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -66,9 +67,10 @@ pub struct Guard {
     /// Files whose mtime keeps staged changes, the checked out branch and the index stable.
     fingerprint: Vec<FileStamp>,
 
-    /// Every directory that could gain or lose a file, with the metadata it had when the guard was
-    /// captured.
-    dirs: Vec<FileStamp>,
+    /// The directories that could gain or lose a file, and the rule files beside them, with the
+    /// metadata they had when the guard was captured, see [`watch_dirs()`]. Shared, because the next
+    /// capture of this repository can take them over instead of walking the worktree again.
+    worktree: Arc<Stamped>,
 
     /// The ignore rules and the configuration that selects them, which can change what a scan
     /// reports without changing a directory, see [`rule_stamps()`].
@@ -105,11 +107,14 @@ impl Guard {
     pub fn record(
         repo: &status::Repo,
         status: impl FnOnce(&status::Repo) -> status::Report,
+        previous: Option<&Guard>,
     ) -> (status::Report, Option<Guard>) {
         let recorded = Guard::recorded(repo);
         // A repository that can't be recorded can't be watched, and walking it would be a waste.
         let watch = match recorded {
-            Some(_) => watch_dirs(&repo.repo),
+            Some(_) => previous
+                .and_then(|guard| guard.reusable_worktree(&repo.repo))
+                .or_else(|| watch_dirs(&repo.repo).map(Arc::new)),
             None => None,
         };
 
@@ -171,19 +176,78 @@ impl Guard {
         repo: &status::Repo,
         report: &status::Report,
         recorded: Recorded,
-        watched: Stamped,
+        worktree: Arc<Stamped>,
     ) -> Option<Guard> {
-        let Stamped { dirs, mut rules } = watched;
-        rules.extend(recorded.rules);
-
         Some(Guard {
             repo: repo.repo.clone(),
             code: report.status.into(),
             staged: report.staged,
             fingerprint: recorded.fingerprint,
-            rules,
-            dirs,
+            rules: recorded.rules,
+            worktree,
             created: Instant::now(),
+        })
+    }
+
+    /// What this guard recorded of the worktree, if the worktree still holds it and it is still
+    /// everything a status of this repository looks into.
+    ///
+    /// Asking costs a `stat` call per directory and per rule file, which is what makes taking it over
+    /// worthwhile over the [walk](watch_dirs()) that found them: that one reads every entry of the
+    /// worktree and matches it against the ignore rules.
+    ///
+    /// Reusing them is as sound as the verdict this was asked for: what they recorded is older than
+    /// the status that is about to be computed, and a change they don't see leaves a stamp that
+    /// doesn't match any more, so the next check computes the status again. What they recorded has to
+    /// cover what the new status looks at, though, which is what the rules and the index are asked
+    /// for: the walk leaves out directories that the rules cover completely, and both can take that
+    /// back.
+    fn reusable_worktree(&self, shared: &ThreadSafeRepository) -> Option<Arc<Stamped>> {
+        let worktree = &self.worktree;
+        let (dirs, rules) = rayon::join(
+            || {
+                worktree
+                    .dirs
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::dir_matches)
+            },
+            || {
+                worktree
+                    .rules
+                    .par_iter()
+                    .with_min_len(PARALLEL_THRESHOLD)
+                    .all(FileStamp::matches)
+                    && self
+                        .rules
+                        .par_iter()
+                        .with_min_len(PARALLEL_THRESHOLD)
+                        .all(FileStamp::matches)
+            },
+        );
+
+        (dirs && rules && self.index_is_inside(shared)).then(|| Arc::clone(&self.worktree))
+    }
+
+    /// Whether the directories the index tracks files in are directories the walk recorded.
+    ///
+    /// A directory whose contents the rules cover and in which nothing is tracked is left out of the
+    /// [walk](watch_dirs()) - everything that can appear in it is covered as well, so watching it
+    /// would be a `stat` call that can never matter. A file below it that the index tracks takes that
+    /// back, and the index is the only one that can say so: the walk that recorded the directory as
+    /// one that can be left out ran against an index without that file.
+    fn index_is_inside(&self, shared: &ThreadSafeRepository) -> bool {
+        let repo = shared.to_thread_local();
+        let Ok(index) = repo.index_or_empty() else {
+            return false;
+        };
+
+        index.entries().iter().all(|entry| {
+            let path = entry.path(&index);
+            path.iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+                .all(|(at, _)| self.worktree.walked.contains(&path[..at]))
         })
     }
 
@@ -212,16 +276,21 @@ impl Guard {
         // one that was read when the status was computed.
         let (dirs, rules) = rayon::join(
             || {
-                self.dirs
+                self.worktree
+                    .dirs
                     .par_iter()
                     .with_min_len(PARALLEL_THRESHOLD)
                     .all(FileStamp::dir_matches)
             },
             || {
-                self.rules
+                self.worktree
+                    .rules
+                    .iter()
+                    .chain(&self.rules)
+                    .collect::<Vec<_>>()
                     .par_iter()
                     .with_min_len(PARALLEL_THRESHOLD)
-                    .all(FileStamp::matches)
+                    .all(|stamp| stamp.matches())
             },
         );
         if !(dirs && rules) {
@@ -575,6 +644,11 @@ pub struct Recorded {
 
 /// The directories of a worktree and the rule files beside them, with what they looked like.
 struct Stamped {
+    /// Every directory the walk descended into, relative to the worktree, so that the index can be
+    /// asked later whether these are still all the directories a status has to look into, see
+    /// [`Guard::index_is_inside()`].
+    walked: HashSet<Vec<u8>>,
+
     dirs: Vec<FileStamp>,
     rules: Vec<FileStamp>,
 }
@@ -617,8 +691,8 @@ fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Stamped> {
     }
 
     let mut dirs: Vec<PathBuf> = rel
-        .into_iter()
-        .map(|path| workdir.join(OsStr::from_bytes(&path)))
+        .iter()
+        .map(|path| workdir.join(OsStr::from_bytes(path)))
         .collect();
     dirs.sort();
 
@@ -640,6 +714,7 @@ fn watch_dirs(shared: &ThreadSafeRepository) -> Option<Stamped> {
         .collect();
 
     Some(Stamped {
+        walked: rel,
         dirs: dir_stamps,
         rules: rule_stamps,
     })
@@ -931,23 +1006,28 @@ pub(crate) mod tests {
         }
 
         /// Track `name`, which holds `content`, in both `HEAD` and the index, so that a change to
-        /// it is a change to the worktree and nothing is staged.
+        /// it is a change to the worktree and nothing is staged. `name` may name a file in a
+        /// directory, which is created as one.
         fn track(&self, name: &str, content: &str) {
             let repo = self.open().repo.to_thread_local();
-            let blob = repo
+            let mut oid = repo
                 .write_blob(content)
                 .expect("a blob can be written")
                 .detach();
-            let mut tree = gix::objs::Tree::empty();
-            tree.entries.push(gix::objs::tree::Entry {
-                mode: gix::objs::tree::EntryKind::Blob.into(),
-                filename: name.into(),
-                oid: blob,
-            });
-            let tree = repo
-                .write_object(&tree)
-                .expect("a tree can be written")
-                .detach();
+            let mut kind = gix::objs::tree::EntryKind::Blob;
+            for component in name.rsplit('/') {
+                let mut tree = gix::objs::Tree::empty();
+                tree.entries.push(gix::objs::tree::Entry {
+                    mode: kind.into(),
+                    filename: component.into(),
+                    oid,
+                });
+                oid = repo
+                    .write_object(&tree)
+                    .expect("a tree can be written")
+                    .detach();
+                kind = gix::objs::tree::EntryKind::Tree;
+            }
             let who = gix::actor::SignatureRef {
                 name: "test".into(),
                 email: "test@example.com".into(),
@@ -955,11 +1035,11 @@ pub(crate) mod tests {
             };
             let parent = repo.head_commit().expect("the repository has a commit").id;
 
-            repo.commit_as(who, who, "HEAD", "track a file", tree, Some(parent))
+            repo.commit_as(who, who, "HEAD", "track a file", oid, Some(parent))
                 .expect("a commit can be created");
 
             let mut index = repo
-                .index_from_tree(&tree)
+                .index_from_tree(&oid)
                 .expect("an index can be built from the tree");
             index
                 .write(gix::index::write::Options::default())
@@ -969,7 +1049,7 @@ pub(crate) mod tests {
         /// Guard the repository as it is now, as the daemon would.
         fn capture(&self) -> Guard {
             let repo = self.open();
-            let (_, guard) = Guard::record(&repo, status::report);
+            let (_, guard) = Guard::record(&repo, status::report, None);
 
             guard.expect("the repository can be watched")
         }
@@ -982,6 +1062,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_ignored_directory_the_index_reaches_into_is_walked_again() {
+        let repo = TempRepo::new("index-reaches-into-an-ignored-directory");
+        std::fs::write(repo.path.join(".gitignore"), "ignored/\n")
+            .expect("the rule can be written");
+        std::fs::create_dir(repo.path.join("ignored")).expect("the directory can be created");
+        std::fs::write(repo.path.join("ignored/a.txt"), "a\n").expect("the file can be written");
+
+        let first = repo.capture();
+        assert!(
+            !first.worktree.walked.contains(b"ignored".as_slice()),
+            "a directory the rules cover and nothing is tracked in is left out of the walk"
+        );
+
+        // `git add --force ignored/a.txt`: the index now tracks a file in there, so the rules and the
+        // attributes of that directory decide what the status of a file in it is.
+        repo.track("ignored/a.txt", "a\n");
+        assert!(
+            first.reusable_worktree(&repo.open().repo).is_none(),
+            "a directory the walk left out that the index reaches into is not taken over"
+        );
+
+        let (_, second) = Guard::record(&repo.open(), status::report, Some(&first));
+        let second = second.expect("the repository can be watched");
+        assert!(
+            second.worktree.walked.contains(b"ignored".as_slice()),
+            "the directory the index tracks a file in is watched"
+        );
+    }
+
+    #[test]
+    fn a_guard_is_not_taken_over_when_the_rules_changed() {
+        let repo = TempRepo::new("changed-rules");
+        let guard = repo.capture();
+
+        // The configuration decides which files the rules are read from, so what a directory holds
+        // can stop being covered without anything in the worktree changing.
+        let config = repo.path.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).expect("the configuration can be read");
+        text.push_str("[core]\n\texcludesFile = /dev/null\n");
+        std::fs::write(&config, text).expect("the configuration can be written");
+
+        assert!(
+            guard.reusable_worktree(&repo.open().repo).is_none(),
+            "a configuration that changed can leave out a directory the walk recorded"
+        );
+    }
+
+    #[test]
+    fn a_recorded_worktree_is_taken_over_only_while_it_holds() {
+        let repo = TempRepo::new("reusable-worktree");
+        let guard = repo.capture();
+
+        assert!(
+            guard.reusable_worktree(&repo.open().repo).is_some(),
+            "a worktree that still holds what was recorded of it can be taken over"
+        );
+
+        std::fs::write(repo.path.join("appeared.txt"), "appeared\n")
+            .expect("the file can be written");
+        assert!(
+            guard.reusable_worktree(&repo.open().repo).is_none(),
+            "a worktree that changed has to be walked again"
+        );
+    }
+
+    #[test]
+    fn a_guard_that_took_over_a_worktree_still_notices_a_change() {
+        let repo = TempRepo::new("reused-worktree");
+        let first = repo.capture();
+
+        // A change outside the worktree leaves the directories the first guard recorded in place, so
+        // the second one takes them over instead of walking them again.
+        repo.track("added.txt", "added\n");
+        assert!(
+            first.reusable_worktree(&repo.open().repo).is_some(),
+            "the directories still hold, so they can be taken over"
+        );
+        let (_, second) = Guard::record(&repo.open(), status::report, Some(&first));
+        let second = second.expect("the repository can be watched");
+
+        std::fs::write(repo.path.join("later.txt"), "later\n").expect("the file can be written");
+        assert_ne!(
+            second.check(),
+            Verdict::Unchanged,
+            "a file that appeared in a directory that was taken over is noticed"
+        );
+    }
+
+    #[test]
     fn a_change_made_while_the_status_is_computed_leaves_the_guard_unknown() {
         let repo = TempRepo::new("changed-while-computing");
         let opened = repo.open();
@@ -989,12 +1158,16 @@ pub(crate) mod tests {
         // Whatever the status computation does, the change it makes here is one that only the work
         // after it can see: the guard is recorded before any of it, so it must not look valid for a
         // status that came before the change.
-        let (_, guard) = Guard::record(&opened, |repo| {
-            std::fs::write(repo.cwd.join("appeared.txt"), "appeared\n")
-                .expect("the file can be written");
+        let (_, guard) = Guard::record(
+            &opened,
+            |repo| {
+                std::fs::write(repo.cwd.join("appeared.txt"), "appeared\n")
+                    .expect("the file can be written");
 
-            status::report(repo)
-        });
+                status::report(repo)
+            },
+            None,
+        );
 
         assert_ne!(
             guard.expect("the repository can be watched").check(),
@@ -1257,7 +1430,9 @@ pub(crate) mod tests {
         std::fs::write(&config, content).expect("the configuration can be written");
 
         assert!(
-            Guard::record(&repo.open(), status::report).1.is_none(),
+            Guard::record(&repo.open(), status::report, None)
+                .1
+                .is_none(),
             "a configuration that can't be resolved must leave the repository unwatched"
         );
     }

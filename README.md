@@ -44,7 +44,9 @@ known.
 
 An entry is still only served for `BASH_GIT_STATUS_TRUST_SECS` (default 60) before the status is
 computed from scratch again, which bounds the effect of filesystems that don't update directory
-mtimes. Once that window has passed, the prompt asking for the status waits for that recomputation,
+mtimes. A recomputation that finds the directories recorded by the entry it replaces still in place
+takes them over instead of walking the worktree again, so the periodic rescan doesn't repeat that
+walk. Once that window has passed, the prompt asking for the status waits for that recomputation,
 so a repository is scanned again at most once every 60 seconds of use; raise the setting if the
 filesystems holding the worktree and `.git` report directory mtimes reliably, or lower it if they
 don't. Nothing else is reused: a repository that can't be watched this way (a sparse index, a

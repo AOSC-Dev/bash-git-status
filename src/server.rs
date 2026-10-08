@@ -301,13 +301,19 @@ fn handle(mut stream: Stream, cache: &Cache, identity: u64) -> Result<()> {
 
     // Every directory of a repository shares one entry, keyed by its root. Whatever that entry
     // can't answer is computed now: the status of a repository the daemon can't watch, and of a
-    // directory that isn't in one, is never taken from an earlier answer.
+    // directory that isn't in one, is never taken from an earlier answer. The guard of the previous
+    // one comes along, since its recording of the worktree may still describe the one the new status
+    // is computed for.
     let root = repo_root(&cwd);
-    let answer = root.as_deref().and_then(|root| reuse_repo(root, cache));
+    let previous = root.as_deref().and_then(|root| last_status(root, cache));
+    let answer = previous
+        .as_ref()
+        .and_then(|(code, guard)| reuse(*code, guard));
     let (code, text) = match answer {
         Some(answer) => answer,
         None => {
-            let (code, text, cached) = compute(&cwd, root.as_deref());
+            let previous = previous.map(|(_, guard)| guard);
+            let (code, text, cached) = compute(&cwd, root.as_deref(), previous.as_deref());
             if let Some((key, entry)) = cached {
                 remember(cache, key, entry);
             }
@@ -340,19 +346,23 @@ fn repo_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Answer a request for a repository whose status was computed before and didn't change since.
-fn reuse_repo(root: &Path, cache: &Cache) -> Option<(i32, String)> {
-    let (code, guard) = {
-        let mut cache = cache.lock().unwrap();
-        let entry = cache.get_mut(root)?;
-        if !entry.guard.fresh() {
-            return None;
-        }
-        entry.last_used = Instant::now();
-        (entry.code, Arc::clone(&entry.guard))
-    };
+/// The status the daemon remembers for the repository rooted at `root`, with the guard that proves
+/// it - which may or may not still hold.
+fn last_status(root: &Path, cache: &Cache) -> Option<(i32, Arc<Guard>)> {
+    let mut cache = cache.lock().unwrap();
+    let entry = cache.get_mut(root)?;
+    entry.last_used = Instant::now();
 
-    // Checking runs the expensive part without holding the lock, and only then is the answer
+    Some((entry.code, Arc::clone(&entry.guard)))
+}
+
+/// Answer with the status of `guard`, if it proves that the repository is still in it.
+fn reuse(code: i32, guard: &Guard) -> Option<(i32, String)> {
+    if !guard.fresh() {
+        return None;
+    }
+
+    // Checking runs the expensive part without holding the cache, and only then is the answer
     // known to be reusable.
     let code = match guard.check() {
         cache::Verdict::Unchanged => code,
@@ -374,7 +384,11 @@ fn reuse_repo(root: &Path, cache: &Cache) -> Option<(i32, String)> {
 /// repository, for one whose repository can't be opened, and for a repository whose changes nothing
 /// would notice. Its answer is then computed for every request - an entry that nothing proves would
 /// otherwise be served while it may already be wrong.
-fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Option<(PathBuf, Entry)>) {
+fn compute(
+    cwd: &Path,
+    root: Option<&Path>,
+    previous: Option<&Guard>,
+) -> (i32, String, Option<(PathBuf, Entry)>) {
     let Ok(repo) = status::get_repo(cwd) else {
         return without_repo();
     };
@@ -384,7 +398,7 @@ fn compute(cwd: &Path, root: Option<&Path>) -> (i32, String, Option<(PathBuf, En
 
     // The guard is recorded for the state the status is computed for, not the other way round: a
     // change made while the status runs must not end up recorded as one the status already reflects.
-    let (report, guard) = cache::Guard::record(&repo, status::report);
+    let (report, guard) = cache::Guard::record(&repo, status::report, previous);
     let code: i32 = report.status.into();
 
     // Only a status that covers the repository as a whole can be watched: a sparse index is served
@@ -658,7 +672,7 @@ mod tests {
     fn a_repository_that_can_be_watched_is_remembered() {
         let repo = TempRepo::new("remembered");
 
-        let (code, _, cached) = compute(&repo.path, Some(&repo.path));
+        let (code, _, cached) = compute(&repo.path, Some(&repo.path), None);
 
         assert_eq!(code, 5);
         assert!(cached.is_some(), "a watchable repository is remembered");
@@ -672,7 +686,7 @@ mod tests {
         content.push_str("[include]\n\tpath = ~no-such-user-bash-git-status/x.cfg\n");
         std::fs::write(&config, content).expect("the configuration can be written");
 
-        let (code, _, cached) = compute(&repo.path, Some(&repo.path));
+        let (code, _, cached) = compute(&repo.path, Some(&repo.path), None);
 
         assert_eq!(code, 5);
         assert!(
@@ -688,7 +702,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("the directory can be created");
 
-        let (code, text, cached) = compute(&dir, None);
+        let (code, text, cached) = compute(&dir, None, None);
 
         assert_eq!((code, text.as_str()), (1, ""));
         assert!(
