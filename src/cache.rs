@@ -93,15 +93,42 @@ enum Tracked {
 }
 
 impl Guard {
-    /// Record what can be recorded before the status that is to be guarded is computed.
+    /// Compute the status of `repo`, and record the state it was computed for.
     ///
-    /// Everything here is read before the status scan starts, so that a change made while it runs
-    /// can't be recorded as one the status already reflects - which would leave the guard looking
-    /// valid for a status that was computed before the change.
+    /// The recording comes first, down to the walk that finds the directories a scan will descend
+    /// into: a stamp taken while the status is computed can record a change the status hasn't seen,
+    /// and the guard would then look valid for a status that is older than its stamps. That is why
+    /// the worktree is walked before the scan rather than beside it, even though both walk it.
     ///
-    /// Returns `None` if the repository can't be watched for changes reliably, in which case the
-    /// caller has to compute its status again for every request.
-    pub fn record(repo: &status::Repo) -> Option<Recorded> {
+    /// The guard is `None` when the repository can't be watched for changes reliably, in which case
+    /// the caller has to compute its status again for every request.
+    pub fn record(
+        repo: &status::Repo,
+        status: impl FnOnce(&status::Repo) -> status::Report,
+    ) -> (status::Report, Option<Guard>) {
+        let recorded = Guard::recorded(repo);
+        // A repository that can't be recorded can't be watched, and walking it would be a waste.
+        let watch = match recorded {
+            Some(_) => watch_dirs(&repo.repo),
+            None => None,
+        };
+
+        let report = status(repo);
+        let guard = match (recorded, watch) {
+            (Some(recorded), Some(watched)) => Guard::capture(repo, &report, recorded, watched),
+            _ => None,
+        };
+
+        (report, guard)
+    }
+
+    /// Record what a status of `repo` is read with, and what could change it.
+    ///
+    /// Everything except the worktree is read here, and the worktree by [`watch_dirs()`], both before
+    /// the status is computed, see [`record()`](Guard::record).
+    ///
+    /// Returns `None` if the repository can't be watched for changes reliably.
+    fn recorded(repo: &status::Repo) -> Option<Recorded> {
         let shared = &repo.repo;
         let tl = shared.to_thread_local();
         let git_dir = tl.git_dir().to_owned();
@@ -140,13 +167,13 @@ impl Guard {
     }
 
     /// Record the state of the repository that `report` was computed for.
-    pub fn capture(
+    fn capture(
         repo: &status::Repo,
         report: &status::Report,
         recorded: Recorded,
-        watch: Watch,
+        watched: Stamped,
     ) -> Option<Guard> {
-        let (dirs, mut rules) = watch.stamps()?;
+        let Stamped { dirs, mut rules } = watched;
         rules.extend(recorded.rules);
 
         Some(Guard {
@@ -546,43 +573,17 @@ pub struct Recorded {
     rules: Vec<FileStamp>,
 }
 
-/// A worktree walk that records the directories it descends into, and stamps them as soon as it
-/// has them.
-///
-/// It is started before the status of a repository is computed, because both walk the worktree and
-/// the operating system can do that on two cores at once, and it stamps the directories while that
-/// scan is still running: the later a directory is stamped, the more likely the stamp is of a
-/// change the scan hasn't seen, which would leave the guard looking valid for a status that was
-/// computed before the change.
-pub struct Watch(Option<std::thread::JoinHandle<Option<Stamped>>>);
-
 /// The directories of a worktree and the rule files beside them, with what they looked like.
 struct Stamped {
     dirs: Vec<FileStamp>,
     rules: Vec<FileStamp>,
 }
 
-impl Watch {
-    /// Start recording the directories of `shared`'s worktree.
-    pub fn start(shared: &ThreadSafeRepository) -> Watch {
-        let shared = shared.clone();
-        let walk = std::thread::Builder::new()
-            .name("bash-git-status walk".into())
-            .spawn(move || watch_dirs(&shared));
-
-        Watch(walk.ok())
-    }
-
-    /// The directories the walk descended into, and the rule files beside them, stamped on the way.
-    fn stamps(self) -> Option<(Vec<FileStamp>, Vec<FileStamp>)> {
-        let Stamped { dirs, rules } = self.0?.join().ok()??;
-
-        Some((dirs, rules))
-    }
-}
-
-/// Every directory that could gain or lose a file, and the rule files beside them, as they were
-/// while the status of the repository was being computed.
+/// Every directory that could gain or lose a file, and the rule files beside them, as they are now.
+///
+/// The walk runs before the status of the repository is computed, and a stamp is taken as soon as
+/// the walk has what it stamps, because a stamp taken later than the reads it is meant to guard can
+/// record a change the status hasn't seen, see [`Guard::record()`].
 ///
 /// A new file changes the mtime of the directory holding it, so watching every directory a status
 /// scan descends into is enough to notice files appearing and disappearing anywhere - including in
@@ -965,14 +966,12 @@ pub(crate) mod tests {
                 .expect("the index can be written");
         }
 
-        /// Capture a guard of the repository as it is now, as the daemon would.
+        /// Guard the repository as it is now, as the daemon would.
         fn capture(&self) -> Guard {
             let repo = self.open();
-            let watch = Watch::start(&repo.repo);
-            let recorded = Guard::record(&repo).expect("the repository can be watched");
-            let report = status::report(&repo);
+            let (_, guard) = Guard::record(&repo, status::report);
 
-            Guard::capture(&repo, &report, recorded, watch).expect("the repository can be watched")
+            guard.expect("the repository can be watched")
         }
     }
 
@@ -980,6 +979,27 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn a_change_made_while_the_status_is_computed_leaves_the_guard_unknown() {
+        let repo = TempRepo::new("changed-while-computing");
+        let opened = repo.open();
+
+        // Whatever the status computation does, the change it makes here is one that only the work
+        // after it can see: the guard is recorded before any of it, so it must not look valid for a
+        // status that came before the change.
+        let (_, guard) = Guard::record(&opened, |repo| {
+            std::fs::write(repo.cwd.join("appeared.txt"), "appeared\n")
+                .expect("the file can be written");
+
+            status::report(repo)
+        });
+
+        assert_ne!(
+            guard.expect("the repository can be watched").check(),
+            Verdict::Unchanged
+        );
     }
 
     #[test]
@@ -1237,7 +1257,7 @@ pub(crate) mod tests {
         std::fs::write(&config, content).expect("the configuration can be written");
 
         assert!(
-            Guard::record(&repo.open()).is_none(),
+            Guard::record(&repo.open(), status::report).1.is_none(),
             "a configuration that can't be resolved must leave the repository unwatched"
         );
     }
