@@ -380,16 +380,45 @@ pub(crate) struct FileStamp {
     pub(crate) path: PathBuf,
     /// `None` if the file doesn't exist or can't be inspected.
     pub(crate) state: Option<(SystemTime, u64, u64)>,
+    /// The same, of what `path` points at when it is a symbolic link, and of what that points at in
+    /// turn.
+    ///
+    /// A rule or a configuration file is read through the link, so changing the file at the end of
+    /// it changes the answer while the link itself stays as it was - and a link can point at
+    /// another link. A file at the end of a link that isn't there is watched as a missing one, so
+    /// that it appearing is noticed as well.
+    pub(crate) target: Option<Box<FileStamp>>,
 }
 
 impl FileStamp {
+    /// Record `path` with the metadata it has now, and what a link of it points at.
     fn read(path: impl Into<PathBuf>) -> FileStamp {
-        let path = path.into();
+        FileStamp::read_depth(path.into(), 0)
+    }
+
+    /// `depth` bounds following a link that leads back to itself.
+    fn read_depth(path: PathBuf, depth: usize) -> FileStamp {
+        /// How many links to follow, like the kernel does before giving up.
+        const MAX_DEPTH: usize = 8;
+
         let metadata = std::fs::symlink_metadata(&path).ok();
+        let target = metadata
+            .as_ref()
+            .filter(|metadata| metadata.is_symlink() && depth < MAX_DEPTH)
+            .and_then(|_| std::fs::read_link(&path).ok())
+            .map(|target| {
+                let target = match target.is_absolute() {
+                    true => target,
+                    false => path.parent().unwrap_or(Path::new("")).join(target),
+                };
+
+                Box::new(FileStamp::read_depth(target, depth + 1))
+            });
 
         FileStamp {
             state: metadata.as_ref().map(stamp_of),
             path,
+            target,
         }
     }
 
@@ -850,6 +879,24 @@ mod tests {
         let guard = repo.capture();
 
         std::fs::write(repo.path.join("empty/new.txt"), "new\n").expect("the file can be written");
+
+        assert_ne!(guard.check(), Verdict::Unchanged);
+    }
+
+    #[test]
+    fn a_change_behind_a_link_is_noticed() {
+        let repo = TempRepo::new("linked-attributes");
+        let target = repo.path.join("attributes.target");
+        std::fs::write(&target, "*.txt\t-text\n").expect("the rule can be written");
+        let link = repo.path.join("attributes");
+        std::os::unix::fs::symlink(&target, &link).expect("the rule can be linked to");
+        let config = repo.path.join(".git/config");
+        let mut content = std::fs::read_to_string(&config).expect("the configuration can be read");
+        content.push_str(&format!("[core]\n\tattributesFile = {}\n", link.display()));
+        std::fs::write(&config, content).expect("the configuration can be written");
+
+        let guard = repo.capture();
+        std::fs::write(&target, "*.txt\ttext\n").expect("the rule can be edited");
 
         assert_ne!(guard.check(), Verdict::Unchanged);
     }
